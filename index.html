@@ -88,6 +88,24 @@
   }
   #overlay p { margin: 0; color: var(--muted); max-width: 420px; }
   #overlay strong { color: var(--text); font-size: 17px; }
+  /* intro: "pick it up" while the board lies on the floor, then an arrow at the power switch */
+  #pickup, #hint { position: absolute; z-index: 2; pointer-events: none; text-align: center; }
+  #pickup[hidden], #hint[hidden] { display: none; }
+  #pickup { left: 0; right: 0; bottom: 8%; color: var(--muted); font-size: 15px; animation: fadein .6s ease-out; }
+  #hint {
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    transform: translate(-50%, -100%); color: var(--accent); animation: fadein .4s ease-out;
+  }
+  .note {
+    background: #0b0d0fd9; border: 1px solid var(--accent); border-radius: 8px; padding: 6px 10px;
+    font-size: 14px; font-weight: 600; white-space: nowrap;
+  }
+  .note small { display: block; color: var(--muted); font-weight: 400; }
+  @media (pointer: coarse) { .note small { display: none; } }
+  #hint svg { width: 24px; height: 40px; animation: bob 1s ease-in-out infinite; }
+  @keyframes bob { 50% { transform: translateY(7px); } }
+  @keyframes fadein { from { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { #hint svg, #pickup, #hint { animation: none; } }
   footer {
     display: flex; gap: 18px; flex-wrap: wrap; justify-content: center;
     padding: 8px 16px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px;
@@ -158,7 +176,14 @@
 <main>
   <div id="view3d"></div>
   <div id="view2d"><div class="bezel"><canvas id="screen2d" width="128" height="64"></canvas></div></div>
-  <div id="overlay">
+  <div id="pickup" hidden>Click or tap to pick it up</div>
+  <div id="hint" hidden>
+    <div class="note">Press the switch to turn it on<small>or press P</small></div>
+    <svg viewBox="0 0 24 40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 2v34M3 27l9 9 9-9"/>
+    </svg>
+  </div>
+  <div id="overlay" hidden>
     <div class="power">⏻</div>
     <strong id="overlayTitle">Switch on</strong>
     <p id="overlayText">Click or press any key, or use the power switch on top of the board (P). The real firmware runs here, compiled to WebAssembly: menu, all games,
@@ -211,12 +236,17 @@ const $ = (id) => document.getElementById(id);
 const overlay = $('overlay');
 let fw = null, poweredOff = true, booting = false, generation = 0;
 let switchOn = false; // position of the power switch; the auto shutdown switches off with it still on
+let everOn = false;   // switched on at least once since the page loaded: no more start hints
 
 addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
   if (e.code === 'KeyP') return void setSwitch(!switchOn);
   if (e.code === 'KeyM') return void toggleMute();
   if (e.code === 'KeyV') return void toggleView();
+  if (intro.phase === 'drop' || intro.phase === 'floor') {
+    e.preventDefault();
+    return void raiseBoard();
+  }
   if (poweredOff) {
     // any key switches on from the start screen and after the auto shutdown, not when switched off by hand
     if (overlay.hidden || e.target.closest('select')) return;
@@ -431,8 +461,11 @@ function setSwitch(on) {
   switchOn = on;
   $('powerBtn').textContent = on ? 'Power off' : 'Power on';
   $('powerBtn').setAttribute('aria-pressed', String(!on));
-  if (on) powerOn();
-  else {
+  if (on) {
+    everOn = true;
+    raiseBoard(); // still on the floor: pick it up
+    powerOn();
+  } else {
     overlay.hidden = true;
     powerOff();
   }
@@ -452,7 +485,6 @@ $('powerBtn').onclick = () => setSwitch(!switchOn);
 $('resetBtn').onclick = () => { if (!poweredOff) restart(); };
 overlay.addEventListener('pointerdown', (e) => { e.preventDefault(); wake(); });
 setSwitch(false);
-overlay.hidden = false;
 
 // ===================================================================================
 // Screen: 128x64 from the emulated SSD1306, tinted like the different OLED modules
@@ -505,7 +537,6 @@ const scene = new THREE.Scene();
 scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
 scene.environmentIntensity = 0.6;
 const camera = new THREE.PerspectiveCamera(30, 1, 10, 1500);
-camera.position.set(0, -32, 165);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.minDistance = 60;
@@ -514,6 +545,241 @@ const key = new THREE.DirectionalLight(0xffffff, 1.6);
 key.position.set(-60, 80, 120);
 scene.add(key, new THREE.AmbientLight(0xffffff, 0.25));
 
+// ===================================================================================
+// Intro: the board drops onto a floor; the first click, tap or key lifts it up to the viewer, then an arrow shows
+// the power switch until it is switched on
+// ===================================================================================
+
+const FLOOR_Y = -40;
+const START_CAM = new THREE.Vector3(0, -32, 165), START_TARGET = new THREE.Vector3();
+const FLOOR_CAM = new THREE.Vector3(0, 55, 100), FLOOR_TARGET = new THREE.Vector3(0, FLOOR_Y + 10, 0);
+const DROP_HEIGHT = 110, RAISE_MS = 1400; // mm above the floor, ms
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const intro = {phase: 'wait', t0: 0, from: null}; // wait (model loading), drop, floor, raise, done
+const rig = new THREE.Group(); // moves the board; identity once it is up
+scene.add(rig);
+camera.position.copy(FLOOR_CAM);
+controls.target.copy(FLOOR_TARGET);
+controls.enabled = false;
+
+// only the board's shadow and a faint glow around it show the floor
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+Object.assign(key.shadow.camera, {left: -110, right: 110, top: 110, bottom: -110, near: 10, far: 500});
+const shadowMat = new THREE.ShadowMaterial({opacity: 0.55});
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(800, 800), shadowMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = FLOOR_Y;
+floor.receiveShadow = true;
+const glowCanvas = document.createElement('canvas');
+glowCanvas.width = glowCanvas.height = 128;
+const gctx = glowCanvas.getContext('2d'), grad = gctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+grad.addColorStop(0, '#8aa0b42e');
+grad.addColorStop(1, '#8aa0b400');
+gctx.fillStyle = grad;
+gctx.fillRect(0, 0, 128, 128);
+const glowMat = new THREE.MeshBasicMaterial({map: new THREE.CanvasTexture(glowCanvas), transparent: true, depthWrite: false});
+const glow = new THREE.Mesh(new THREE.PlaneGeometry(320, 320), glowMat);
+glow.rotation.x = -Math.PI / 2;
+glow.position.y = FLOOR_Y - 0.05;
+scene.add(floor, glow);
+
+// ===================================================================================
+// Drop physics: the board as a rigid body falling onto the floor. Its contact points are the extreme vertices of
+// the model (an approximate convex hull), so it lands on the battery holder and tips over onto the PCB's edge.
+// ===================================================================================
+
+const GRAVITY = 1200;           // mm/s², slow motion: an eighth of the real thing
+const RESTITUTION = 0.12, FRICTION = 0.6;
+const CONTACT_DAMPING = 0.985;  // per step while touching the floor: settles softly instead of rolling over
+const SIM_DT = 1 / 240;
+const SLOW_MOTION = 0.6;        // simulated seconds per real second
+const body = {
+  x: new THREE.Vector3(), q: new THREE.Quaternion(), v: new THREE.Vector3(), w: new THREE.Vector3(),
+  com: new THREE.Vector3(), // centre of mass in the rig's frame
+  pts: [],                  // contact points relative to the centre of mass, rig's frame
+  invI: new THREE.Vector3(), // inverse inertia, principal axes = rig axes
+  rest: 0, t: 0,
+};
+
+// Called once with the rig at rest: hull points from all vertices, inertia of a uniform box around them
+function buildBody() {
+  rig.updateMatrixWorld(true);
+  const all = [], v = new THREE.Vector3();
+  rig.traverse((o) => {
+    if (!o.isMesh) return;
+    const pos = o.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      all.push(v.x, v.y, v.z);
+    }
+  });
+  const box = new THREE.Box3().setFromArray(all), size = box.getSize(new THREE.Vector3());
+  box.getCenter(body.com);
+  const picked = new Set(), N = 300;
+  for (let k = 0; k < N; k++) { // the most extreme vertex in each of N directions (Fibonacci sphere)
+    const y = 1 - (2 * (k + 0.5)) / N, r = Math.sqrt(1 - y * y), a = k * 2.39996;
+    const dx = Math.cos(a) * r, dz = Math.sin(a) * r;
+    let best = 0, bestDot = -Infinity;
+    for (let i = 0; i < all.length; i += 3) {
+      const d = all[i] * dx + all[i + 1] * y + all[i + 2] * dz;
+      if (d > bestDot) { bestDot = d; best = i; }
+    }
+    picked.add(best);
+  }
+  body.pts = [...picked].map((i) => new THREE.Vector3(all[i], all[i + 1], all[i + 2]).sub(body.com));
+  const [a, b, c] = [size.x ** 2, size.y ** 2, size.z ** 2];
+  body.invI.set(12 / (b + c), 12 / (a + c), 12 / (a + b)); // mass 1
+}
+
+// Face up above the floor, a little turned and barely tilted, without spin
+function startDrop() {
+  const tilt = () => (Math.random() - 0.5) * 0.06;
+  body.q.setFromEuler(new THREE.Euler(-Math.PI / 2 + BOARD_TILT + tilt(), 0.3 + (Math.random() - 0.5) * 0.3, tilt(), 'YXZ'));
+  let low = Infinity;
+  for (const p of body.pts) low = Math.min(low, p.clone().applyQuaternion(body.q).y);
+  body.x.set(0, FLOOR_Y + DROP_HEIGHT - low, 0);
+  body.v.set(0, 0, 0);
+  body.w.set(0, 0, 0);
+  body.rest = body.t = 0;
+  applyBody();
+}
+
+function applyBody() { // rig position from the centre of mass
+  rig.quaternion.copy(body.q);
+  rig.position.copy(body.com).applyQuaternion(body.q).negate().add(body.x);
+}
+
+const _qi = new THREE.Quaternion(), _t = new THREE.Vector3(), _u = new THREE.Vector3();
+function invInertia(q, vec, out) { // world inverse inertia times vec
+  _qi.copy(q).invert();
+  out.copy(vec).applyQuaternion(_qi).multiply(body.invI).applyQuaternion(q);
+  return out;
+}
+
+// One step of a small impulse solver: gravity, then contacts with the floor (sequential impulses with friction)
+function stepBody(dt) {
+  const {x, q, v, w} = body;
+  v.y -= GRAVITY * dt;
+  x.addScaledVector(v, dt);
+  const dq = new THREE.Quaternion(w.x * dt / 2, w.y * dt / 2, w.z * dt / 2, 0).multiply(q);
+  q.set(q.x + dq.x, q.y + dq.y, q.z + dq.z, q.w + dq.w).normalize();
+
+  const contacts = [];
+  let pen = 0;
+  for (const p of body.pts) {
+    const r = p.clone().applyQuaternion(q);
+    const depth = FLOOR_Y - (x.y + r.y);
+    if (depth <= 0) continue;
+    pen = Math.max(pen, depth);
+    const vn = v.y + (w.z * r.x - w.x * r.z); // (w × r).y
+    contacts.push({r, acc: 0, accT: new THREE.Vector3(), target: vn < -150 ? -RESTITUTION * vn : 0});
+  }
+  const n = new THREE.Vector3(0, 1, 0), vp = new THREE.Vector3(), rn = new THREE.Vector3();
+  const kAlong = (r, dir) => 1 + invInertia(q, rn.crossVectors(r, dir), _u).cross(r).dot(dir);
+  for (let it = 0; it < 10; it++)
+    for (const c of contacts) {
+      vp.crossVectors(w, c.r).add(v);
+      // normal: only pushes, aims for the bounce velocity
+      let dj = (c.target - vp.y) / kAlong(c.r, n);
+      const acc = Math.max(0, c.acc + dj);
+      dj = acc - c.acc;
+      c.acc = acc;
+      v.y += dj;
+      w.add(invInertia(q, rn.crossVectors(c.r, n).multiplyScalar(dj), _t));
+      // friction: against the sliding velocity, at most FRICTION times the normal impulse
+      vp.crossVectors(w, c.r).add(v);
+      const slide = new THREE.Vector3(vp.x, 0, vp.z), sl = slide.length();
+      if (sl < 1e-6) continue;
+      slide.divideScalar(sl);
+      const want = c.accT.clone().addScaledVector(slide, -sl / kAlong(c.r, slide));
+      const max = FRICTION * c.acc;
+      if (want.length() > max) want.setLength(max);
+      const jt = want.clone().sub(c.accT);
+      c.accT.copy(want);
+      v.add(jt);
+      w.add(invInertia(q, rn.crossVectors(c.r, jt), _t));
+    }
+  x.y += pen * 0.8; // out of the floor
+  if (contacts.length) {
+    v.x *= CONTACT_DAMPING; v.z *= CONTACT_DAMPING; w.multiplyScalar(CONTACT_DAMPING);
+  }
+  body.t += dt;
+  body.rest = contacts.length && v.length() < 8 && w.length() < 0.08 ? body.rest + dt : 0;
+  return body.rest > 0.3 || body.t > 8; // at rest
+}
+
+function startIntro() {
+  if (document.body.classList.contains('flat')) return finishIntro();
+  startDrop();
+  if (reduceMotion) { // lands at once
+    while (!stepBody(SIM_DT));
+    applyBody();
+  }
+  intro.phase = reduceMotion ? 'floor' : 'drop';
+  intro.t0 = performance.now();
+}
+
+function raiseBoard() {
+  if (intro.phase !== 'drop' && intro.phase !== 'floor') return;
+  intro.from = {pos: rig.position.clone(), quat: rig.quaternion.clone(), cam: camera.position.clone(), target: controls.target.clone()};
+  intro.phase = 'raise';
+  intro.t0 = performance.now();
+  if (reduceMotion) finishIntro();
+}
+
+function finishIntro() {
+  intro.phase = 'done';
+  rig.position.set(0, 0, 0);
+  rig.quaternion.identity();
+  camera.position.copy(START_CAM);
+  controls.target.copy(START_TARGET);
+  controls.enabled = true;
+  floor.visible = glow.visible = false;
+  key.castShadow = false;
+}
+
+const smooth = (p) => (p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) ** 3 / 2);
+
+function updateIntro(now) {
+  if (intro.phase === 'drop') {
+    // fixed steps for the time since the last frame (at most 1/20 s of simulation after a stall)
+    let steps = Math.min(Math.round(((now - intro.t0) / 1000) * SLOW_MOTION / SIM_DT), 12);
+    intro.t0 += (steps * SIM_DT * 1000) / SLOW_MOTION;
+    if (steps === 12) intro.t0 = now;
+    while (steps-- > 0)
+      if (stepBody(SIM_DT)) {
+        intro.phase = 'floor';
+        break;
+      }
+    applyBody();
+  } else if (intro.phase === 'raise') {
+    const p = Math.min(1, (now - intro.t0) / RAISE_MS), e = smooth(p), f = intro.from;
+    rig.position.lerpVectors(f.pos, START_TARGET, e).y += Math.sin(Math.PI * p) * 12; // a little arc
+    rig.quaternion.slerpQuaternions(f.quat, new THREE.Quaternion(), e);
+    camera.position.lerpVectors(f.cam, START_CAM, e);
+    controls.target.lerpVectors(f.target, START_TARGET, e);
+    shadowMat.opacity = 0.55 * (1 - e);
+    glowMat.opacity = 1 - e;
+    if (p === 1) finishIntro();
+  }
+  $('pickup').hidden = intro.phase !== 'floor';
+}
+
+// The arrow points down at the top of the switch's lever, wherever the board has been turned to
+const hint = $('hint'), hintBox = new THREE.Box3(), hintPt = new THREE.Vector3();
+function updateHint() {
+  hint.hidden = intro.phase !== 'done' || everOn || !power || document.body.classList.contains('flat');
+  if (hint.hidden) return;
+  hintBox.setFromObject(power.node);
+  hintBox.getCenter(hintPt).y = hintBox.max.y;
+  hintPt.project(camera);
+  hint.style.left = ((hintPt.x + 1) / 2) * host.clientWidth + 'px';
+  hint.style.top = ((1 - hintPt.y) / 2) * host.clientHeight - 6 + 'px';
+}
+
 const screenTex = new THREE.CanvasTexture(scr);
 screenTex.magFilter = THREE.NearestFilter;
 screenTex.minFilter = THREE.LinearFilter;
@@ -521,11 +787,13 @@ screenTex.colorSpace = THREE.SRGBColorSpace;
 const plungers = {};
 let ledMat = null, power = null, powerHit = null;
 const POWER_TRAVEL = 1.5; // mm the slider moves from off (its position in the model) to on
+const BOARD_TILT = 0.12; // the board leans back a little in the start view
 
 new GLTFLoader().load('etboy.glb', (gltf) => {
   const board = gltf.scene;
-  board.rotation.x = -0.12;
+  board.rotation.x = -BOARD_TILT;
   board.traverse((o) => {
+    if (o.isMesh) o.castShadow = true;
     if (o.name === 'screen') o.material = new THREE.MeshBasicMaterial({map: screenTex, toneMapped: false});
     else if (o.name === 'led') ledMat = o.material = o.material.clone();
     else if (o.name.startsWith('btn_')) {
@@ -534,7 +802,8 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
       o.userData.btn = b;
     } else if (o.name === 'power') power = {node: o, rest: o.position.x};
   });
-  scene.add(board);
+  rig.add(board); // the rig is at rest (identity) until startDrop()
+  let hit = null;
   if (power) { // the lever is small: an invisible box around it and its travel takes the clicks
     board.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(power.node).expandByScalar(2.5);
@@ -542,8 +811,11 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
     box.max.x += POWER_TRAVEL;
     powerHit = new THREE.Mesh(new THREE.BoxGeometry(...box.getSize(new THREE.Vector3()).toArray()), new THREE.MeshBasicMaterial({visible: false}));
     box.getCenter(powerHit.position);
-    scene.add(powerHit);
+    hit = powerHit;
   }
+  buildBody(); // without the click box, which reaches below the board
+  if (hit) rig.add(hit);
+  startIntro();
 }, undefined, (err) => {
   console.warn('no 3D model', err);
   toggleView(true);
@@ -552,6 +824,7 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
 // Click/touch the board's buttons
 const ray = new THREE.Raycaster();
 renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (intro.phase !== 'done') return void raiseBoard();
   const r = renderer.domElement.getBoundingClientRect();
   ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
   const hit = ray.intersectObjects([...Object.values(plungers).map((p) => p.node), ...(powerHit ? [powerHit] : [])], false)[0];
@@ -567,7 +840,7 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 });
 const release = (e) => {
   for (const h of held) if (h.startsWith('ptr:' + e.pointerId + ':')) held.delete(h);
-  controls.enabled = true;
+  controls.enabled = intro.phase === 'done';
   updateButtons();
 };
 renderer.domElement.addEventListener('pointerup', release);
@@ -586,6 +859,10 @@ new ResizeObserver(resize).observe(host);
 
 function toggleView(flat) {
   document.body.classList.toggle('flat', flat ?? !document.body.classList.contains('flat'));
+  const isFlat = document.body.classList.contains('flat');
+  if (isFlat && intro.phase !== 'done' && intro.phase !== 'wait') finishIntro();
+  // the flat view has no switch to point at: the start overlay switches on there
+  if (!everOn && !switchOn) overlay.hidden = !isFlat;
   $('viewBtn').textContent = document.body.classList.contains('flat') ? '3D board' : '2D screen';
   try { localStorage.setItem('etboy-flat', document.body.classList.contains('flat') ? '1' : '0'); } catch {}
   resize();
@@ -594,6 +871,7 @@ $('viewBtn').onclick = () => toggleView();
 try { if (localStorage.getItem('etboy-flat') === '1') toggleView(true); } catch {}
 
 renderer.setAnimationLoop(() => {
+  updateIntro(performance.now());
   drawScreen();
   screenTex.needsUpdate = true;
   for (const [b, p] of Object.entries(plungers)) p.node.position.z = p.rest - (buttons & BTN[b] ? 0.6 : 0);
@@ -603,6 +881,7 @@ renderer.setAnimationLoop(() => {
     controls.update();
     renderer.render(scene, camera);
   }
+  updateHint();
 });
 </script>
 </body>

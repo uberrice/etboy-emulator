@@ -89,10 +89,10 @@
   #overlay p { margin: 0; color: var(--muted); max-width: 420px; }
   #overlay strong { color: var(--text); font-size: 17px; }
   /* intro: "pick it up" while the board lies on the floor, then an arrow at the power switch */
-  #pickup, #hint { position: absolute; z-index: 2; pointer-events: none; text-align: center; }
-  #pickup[hidden], #hint[hidden] { display: none; }
+  #pickup, .hint { position: absolute; z-index: 2; pointer-events: none; text-align: center; }
+  #pickup[hidden], .hint[hidden] { display: none; }
   #pickup { left: 0; right: 0; bottom: 8%; color: var(--muted); font-size: 15px; animation: fadein .6s ease-out; }
-  #hint {
+  .hint {
     display: flex; flex-direction: column; align-items: center; gap: 2px;
     transform: translate(-50%, -100%); color: var(--accent); animation: fadein .4s ease-out;
   }
@@ -101,11 +101,11 @@
     font-size: 14px; font-weight: 600; white-space: nowrap;
   }
   .note small { display: block; color: var(--muted); font-weight: 400; }
-  @media (pointer: coarse) { .note small { display: none; } }
-  #hint svg { width: 24px; height: 40px; animation: bob 1s ease-in-out infinite; }
+  @media (pointer: coarse) { .note small.keys { display: none; } }
+  .hint svg { width: 24px; height: 40px; animation: bob 1s ease-in-out infinite; }
   @keyframes bob { 50% { transform: translateY(7px); } }
   @keyframes fadein { from { opacity: 0; } }
-  @media (prefers-reduced-motion: reduce) { #hint svg, #pickup, #hint { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .hint svg, #pickup, .hint { animation: none; } }
   footer {
     display: flex; gap: 18px; flex-wrap: wrap; justify-content: center;
     padding: 8px 16px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px;
@@ -177,8 +177,14 @@
   <div id="view3d"></div>
   <div id="view2d"><div class="bezel"><canvas id="screen2d" width="128" height="64"></canvas></div></div>
   <div id="pickup" hidden>Click or tap to pick it up</div>
-  <div id="hint" hidden>
-    <div class="note">Press the switch to turn it on<small>or press P</small></div>
+  <div id="hint" class="hint" hidden>
+    <div class="note">Press the switch to turn it on<small class="keys">or press P</small></div>
+    <svg viewBox="0 0 24 40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 2v34M3 27l9 9 9-9"/>
+    </svg>
+  </div>
+  <div id="batHint" class="hint" hidden>
+    <div class="note">Easy on the hardware, it's not a stress ball!<small id="batHintText">Click the battery to put it back in</small></div>
     <svg viewBox="0 0 24 40" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
       <path d="M12 2v34M3 27l9 9 9-9"/>
     </svg>
@@ -401,7 +407,7 @@ $('muteBtn').onclick = () => (audio && audio.state !== 'running' && !muted ? unl
 const SAVE_KEY = 'etboy-save';
 
 async function powerOn() {
-  if (booting || !switchOn) return;
+  if (booting || !switchOn || bat.state !== 'in') return;
   booting = true;
   overlay.hidden = true;
   $('status').textContent = 'booting';
@@ -428,7 +434,7 @@ async function powerOn() {
     },
   });
   booting = false;
-  if (!switchOn) { // switched off again while booting
+  if (!switchOn || bat.state !== 'in') { // switched off again (or lost the battery) while booting
     inst._emu_power_off();
     generation++;
     return;
@@ -473,6 +479,7 @@ function setSwitch(on) {
 
 // From the overlay: flips the switch on, or starts again after the auto shutdown (switch still on)
 function wake() {
+  if (bat.state !== 'in') insertBattery(true); // the 2D view's "No battery" screen puts it back at once
   if (switchOn) powerOn();
   else setSwitch(true);
 }
@@ -596,13 +603,15 @@ const RESTITUTION = 0.12, FRICTION = 0.6;
 const CONTACT_DAMPING = 0.985;  // per step while touching the floor: settles softly instead of rolling over
 const SIM_DT = 1 / 240;
 const SLOW_MOTION = 0.6;        // simulated seconds per real second
-const body = {
+const newBody = (e) => ({
   x: new THREE.Vector3(), q: new THREE.Quaternion(), v: new THREE.Vector3(), w: new THREE.Vector3(),
-  com: new THREE.Vector3(), // centre of mass in the rig's frame
-  pts: [],                  // contact points relative to the centre of mass, rig's frame
-  invI: new THREE.Vector3(), // inverse inertia, principal axes = rig axes
+  com: new THREE.Vector3(), // centre of mass in the body's frame
+  pts: [],                  // contact points relative to the centre of mass, body's frame
+  invI: new THREE.Vector3(), // inverse inertia, principal axes = body axes
+  e,                        // restitution
   rest: 0, t: 0,
-};
+});
+const body = newBody(RESTITUTION); // the board (the rig)
 
 // Called once with the rig at rest: hull points from all vertices, inertia of a uniform box around them
 function buildBody() {
@@ -653,15 +662,15 @@ function applyBody() { // rig position from the centre of mass
 }
 
 const _qi = new THREE.Quaternion(), _t = new THREE.Vector3(), _u = new THREE.Vector3();
-function invInertia(q, vec, out) { // world inverse inertia times vec
-  _qi.copy(q).invert();
-  out.copy(vec).applyQuaternion(_qi).multiply(body.invI).applyQuaternion(q);
+function invInertia(b, vec, out) { // world inverse inertia times vec
+  _qi.copy(b.q).invert();
+  out.copy(vec).applyQuaternion(_qi).multiply(b.invI).applyQuaternion(b.q);
   return out;
 }
 
 // One step of a small impulse solver: gravity, then contacts with the floor (sequential impulses with friction)
-function stepBody(dt) {
-  const {x, q, v, w} = body;
+function stepBody(b, dt) {
+  const {x, q, v, w} = b;
   v.y -= GRAVITY * dt;
   x.addScaledVector(v, dt);
   const dq = new THREE.Quaternion(w.x * dt / 2, w.y * dt / 2, w.z * dt / 2, 0).multiply(q);
@@ -669,16 +678,16 @@ function stepBody(dt) {
 
   const contacts = [];
   let pen = 0;
-  for (const p of body.pts) {
+  for (const p of b.pts) {
     const r = p.clone().applyQuaternion(q);
     const depth = FLOOR_Y - (x.y + r.y);
     if (depth <= 0) continue;
     pen = Math.max(pen, depth);
     const vn = v.y + (w.z * r.x - w.x * r.z); // (w × r).y
-    contacts.push({r, acc: 0, accT: new THREE.Vector3(), target: vn < -150 ? -RESTITUTION * vn : 0});
+    contacts.push({r, acc: 0, accT: new THREE.Vector3(), target: vn < -150 ? -b.e * vn : 0});
   }
   const n = new THREE.Vector3(0, 1, 0), vp = new THREE.Vector3(), rn = new THREE.Vector3();
-  const kAlong = (r, dir) => 1 + invInertia(q, rn.crossVectors(r, dir), _u).cross(r).dot(dir);
+  const kAlong = (r, dir) => 1 + invInertia(b, rn.crossVectors(r, dir), _u).cross(r).dot(dir);
   for (let it = 0; it < 10; it++)
     for (const c of contacts) {
       vp.crossVectors(w, c.r).add(v);
@@ -688,7 +697,7 @@ function stepBody(dt) {
       dj = acc - c.acc;
       c.acc = acc;
       v.y += dj;
-      w.add(invInertia(q, rn.crossVectors(c.r, n).multiplyScalar(dj), _t));
+      w.add(invInertia(b, rn.crossVectors(c.r, n).multiplyScalar(dj), _t));
       // friction: against the sliding velocity, at most FRICTION times the normal impulse
       vp.crossVectors(w, c.r).add(v);
       const slide = new THREE.Vector3(vp.x, 0, vp.z), sl = slide.length();
@@ -700,22 +709,32 @@ function stepBody(dt) {
       const jt = want.clone().sub(c.accT);
       c.accT.copy(want);
       v.add(jt);
-      w.add(invInertia(q, rn.crossVectors(c.r, jt), _t));
+      w.add(invInertia(b, rn.crossVectors(c.r, jt), _t));
     }
   x.y += pen * 0.8; // out of the floor
   if (contacts.length) {
     v.x *= CONTACT_DAMPING; v.z *= CONTACT_DAMPING; w.multiplyScalar(CONTACT_DAMPING);
   }
-  body.t += dt;
-  body.rest = contacts.length && v.length() < 8 && w.length() < 0.08 ? body.rest + dt : 0;
-  return body.rest > 0.3 || body.t > 8; // at rest
+  b.t += dt;
+  b.rest = contacts.length && v.length() < 8 && w.length() < 0.08 ? b.rest + dt : 0;
+  return b.rest > 0.3 || b.t > 8; // at rest
+}
+
+// Fixed steps for the real time since the last call (at most 1/20 s of simulation after a stall); clock.t0 is the
+// real time simulated up to. True once the body is at rest.
+function runBody(b, clock, now) {
+  let steps = Math.min(Math.round(((now - clock.t0) / 1000) * SLOW_MOTION / SIM_DT), 12);
+  clock.t0 += (steps * SIM_DT * 1000) / SLOW_MOTION;
+  if (steps === 12) clock.t0 = now;
+  while (steps-- > 0) if (stepBody(b, SIM_DT)) return true;
+  return false;
 }
 
 function startIntro() {
   if (document.body.classList.contains('flat')) return finishIntro();
   startDrop();
   if (reduceMotion) { // lands at once
-    while (!stepBody(SIM_DT));
+    while (!stepBody(body, SIM_DT));
     applyBody();
   }
   intro.phase = reduceMotion ? 'floor' : 'drop';
@@ -745,15 +764,7 @@ const smooth = (p) => (p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) ** 3 / 2);
 
 function updateIntro(now) {
   if (intro.phase === 'drop') {
-    // fixed steps for the time since the last frame (at most 1/20 s of simulation after a stall)
-    let steps = Math.min(Math.round(((now - intro.t0) / 1000) * SLOW_MOTION / SIM_DT), 12);
-    intro.t0 += (steps * SIM_DT * 1000) / SLOW_MOTION;
-    if (steps === 12) intro.t0 = now;
-    while (steps-- > 0)
-      if (stepBody(SIM_DT)) {
-        intro.phase = 'floor';
-        break;
-      }
+    if (runBody(body, intro, now)) intro.phase = 'floor';
     applyBody();
   } else if (intro.phase === 'raise') {
     const p = Math.min(1, (now - intro.t0) / RAISE_MS), e = smooth(p), f = intro.from;
@@ -771,7 +782,7 @@ function updateIntro(now) {
 // The arrow points down at the top of the switch's lever, wherever the board has been turned to
 const hint = $('hint'), hintBox = new THREE.Box3(), hintPt = new THREE.Vector3();
 function updateHint() {
-  hint.hidden = intro.phase !== 'done' || everOn || !power || document.body.classList.contains('flat');
+  hint.hidden = intro.phase !== 'done' || everOn || !power || bat.state !== 'in' || document.body.classList.contains('flat');
   if (hint.hidden) return;
   hintBox.setFromObject(power.node);
   hintBox.getCenter(hintPt).y = hintBox.max.y;
@@ -785,9 +796,191 @@ screenTex.magFilter = THREE.NearestFilter;
 screenTex.minFilter = THREE.LinearFilter;
 screenTex.colorSpace = THREE.SRGBColorSpace;
 const plungers = {};
-let ledMat = null, power = null, powerHit = null;
+let ledMat = null, power = null, powerHit = null, boardNode = null;
 const POWER_TRAVEL = 1.5; // mm the slider moves from off (its position in the model) to on
 const BOARD_TILT = 0.12; // the board leans back a little in the start view
+
+// ===================================================================================
+// Battery: an AAA cell in the holder on the back. Clicking it fast enough rattles it loose until it pops out and
+// drops to the floor, which switches the board off; a click on it puts it back.
+// ===================================================================================
+
+// Seat in the board's frame: the holder's cavity is x -22.8..23.2, y -14..-3.5 (10.5 mm wide), its floor at z -0.9;
+// the + nub touches the -x wall, the - end presses the spring (tips at x 21.2)
+const BAT_R = 5.25, BAT_LEN = 44.5, BAT_SEAT = new THREE.Vector3(-22.8 + BAT_LEN / 2, -8.75, -0.9 - BAT_R);
+const BAT_PIVOT = new THREE.Vector3(BAT_LEN / 2, 0, 0); // the - end stays at the spring while it rattles
+const BAT_SHAKE = 0.14, BAT_CALM = 0.35, BAT_BACK_MS = 900; // per click, decay per second, reinsert time
+const BAT_LOCKOUT_MS = 1000; // after it pops out, so the clicks that shook it loose don't put it straight back
+const bat = {state: 'in', shake: 0, kick: 0, t0: 0, outAt: 0, from: null, body: newBody(0.3)}; // in, falling, floor, back
+
+function batteryLabel() {
+  const c = document.createElement('canvas'); // u around the cell, v along it: + end at the bottom
+  c.width = 256;
+  c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = '#1d3f8f';
+  g.fillRect(0, 0, 256, 512);
+  g.fillStyle = '#9fe04a';
+  g.fillRect(0, 400, 256, 70);
+  g.fillStyle = '#e8eef8';
+  g.fillRect(0, 392, 256, 6);
+  for (const u of [64, 192]) { // twice around, one side always shows
+    g.save();
+    g.translate(u, 210);
+    g.rotate(-Math.PI / 2);
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = 'bold 50px system-ui, sans-serif';
+    g.fillText('AAA', -40, 0);
+    g.font = '32px system-ui, sans-serif';
+    g.fillText('1.5 V', 80, 0);
+    g.restore();
+    g.save();
+    g.translate(u, 435);
+    g.rotate(-Math.PI / 2);
+    g.fillStyle = '#1d3f8f';
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = 'bold 48px system-ui, sans-serif';
+    g.fillText('+', 0, 0);
+    g.restore();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+const battery = new THREE.Group();
+{
+  const metal = new THREE.MeshStandardMaterial({color: 0xc9ccd2, metalness: 1, roughness: 0.3});
+  const part = (r, x0, x1, mat) => { // cylinder along x from x0 to x1
+    const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, x1 - x0, 40).rotateZ(-Math.PI / 2), mat);
+    m.position.x = (x0 + x1) / 2;
+    m.castShadow = true;
+    battery.add(m);
+    return m;
+  };
+  const h = BAT_LEN / 2;
+  part(BAT_R - 0.05, -h + 1.15, h - 0.35, new THREE.MeshStandardMaterial({map: batteryLabel(), roughness: 0.4, metalness: 0.1}));
+  part(BAT_R - 0.35, -h + 0.8, -h + 1.15, metal); // + shoulder
+  part(1.9, -h, -h + 0.8, metal);                  // + nub
+  part(BAT_R - 0.35, h - 0.35, h, metal);          // - end
+  battery.position.copy(BAT_SEAT);
+  // contact points: rims of both ends and the nub; inertia of a solid cylinder
+  for (let k = 0; k < 16; k++) {
+    const a = (k / 16) * Math.PI * 2, y = Math.cos(a), z = Math.sin(a);
+    bat.body.pts.push(new THREE.Vector3(-h + 0.8, y * (BAT_R - 0.3), z * (BAT_R - 0.3)), new THREE.Vector3(h, y * (BAT_R - 0.3), z * (BAT_R - 0.3)));
+    if (k % 4 === 0) bat.body.pts.push(new THREE.Vector3(-h, y * 1.9, z * 1.9));
+  }
+  const ir = 2 / BAT_R ** 2, il = 12 / (3 * BAT_R ** 2 + BAT_LEN ** 2);
+  bat.body.invI.set(ir, il, il);
+}
+const isBattery = (o) => { for (; o; o = o.parent) if (o === battery) return true; return false; };
+
+// A click on the battery: rattles it while it sits, puts it back once it is out
+function pokeBattery() {
+  if (bat.state === 'in') {
+    bat.shake += BAT_SHAKE;
+    bat.kick = 1;
+    if (bat.shake >= 1) dropBattery();
+  } else if (bat.state !== 'back' && performance.now() - bat.outAt > BAT_LOCKOUT_MS) insertBattery(reduceMotion);
+}
+
+const _q = new THREE.Quaternion(), _e = new THREE.Euler();
+// Seated pose with the rattle: turned about the - end, the + end lifting out of the holder more the looser it is
+function jiggleBattery(now) {
+  const t = now / 1000, a = reduceMotion ? 0 : Math.min(1, bat.shake + bat.kick * 0.3);
+  _e.set(a * 0.035 * Math.sin(t * 53), -(bat.shake ** 3) * 0.1 - a * 0.05 * (0.5 + 0.5 * Math.sin(t * 41)), a * 0.03 * Math.sin(t * 37 + 1));
+  battery.quaternion.setFromEuler(_e);
+  battery.position.copy(BAT_PIVOT).applyQuaternion(battery.quaternion).negate().add(BAT_PIVOT).add(BAT_SEAT);
+  battery.position.z -= a * 0.4 * Math.abs(Math.sin(t * 29));
+}
+
+function dropBattery() {
+  bat.state = 'falling';
+  bat.shake = bat.kick = 0;
+  scene.attach(battery); // keeps its place in the world
+  const b = bat.body;
+  b.x.copy(battery.position);
+  b.q.copy(battery.quaternion);
+  const out = new THREE.Vector3(0, 0, -1).applyQuaternion(boardNode.getWorldQuaternion(_q)); // out of the back
+  b.v.copy(out).multiplyScalar(200).y += 50;
+  b.w.set(0, -3, 0).applyQuaternion(_q).addScaledVector(new THREE.Vector3().randomDirection(), 1.5); // + end first
+  b.rest = b.t = 0;
+  bat.t0 = bat.outAt = performance.now();
+  if (reduceMotion) {
+    while (!stepBody(b, SIM_DT));
+    bat.state = 'floor';
+  }
+  battery.position.copy(b.x);
+  battery.quaternion.copy(b.q);
+  overlay.hidden = true;
+  powerOff();
+  $('status').textContent = 'no battery';
+}
+
+// Back into the holder in an arc (instant: no animation); the board starts if the switch is still on
+function insertBattery(instant) {
+  if (instant) return seatBattery();
+  bat.state = 'back';
+  bat.t0 = performance.now();
+  bat.from = {pos: battery.position.clone(), quat: battery.quaternion.clone()};
+}
+
+function seatBattery() {
+  boardNode.add(battery);
+  battery.position.copy(BAT_SEAT);
+  battery.quaternion.identity();
+  bat.state = 'in';
+  bat.shake = bat.kick = 0;
+  $('status').textContent = 'off';
+  powerOn();
+}
+
+const _p = new THREE.Vector3();
+let lastFrame = performance.now(), floorShown = 0;
+function updateBattery(now) {
+  const dt = Math.min(0.1, (now - lastFrame) / 1000);
+  lastFrame = now;
+  if (bat.state === 'in') {
+    bat.shake = Math.max(0, bat.shake - BAT_CALM * dt);
+    bat.kick *= Math.exp(-dt * 10);
+    jiggleBattery(now);
+  } else if (bat.state === 'falling') {
+    if (runBody(bat.body, bat, now)) bat.state = 'floor';
+    battery.position.copy(bat.body.x);
+    battery.quaternion.copy(bat.body.q);
+  } else if (bat.state === 'back') {
+    const p = Math.min(1, (now - bat.t0) / BAT_BACK_MS), e = smooth(p);
+    boardNode.updateMatrixWorld();
+    _p.copy(BAT_SEAT).applyMatrix4(boardNode.matrixWorld);
+    battery.position.lerpVectors(bat.from.pos, _p, e).y += Math.sin(Math.PI * p) * 25;
+    battery.quaternion.slerpQuaternions(bat.from.quat, boardNode.getWorldQuaternion(_q), e);
+    if (p === 1) seatBattery();
+  }
+  // the floor shows again while the battery is out
+  if (intro.phase === 'done') {
+    floorShown += ((bat.state === 'in' ? 0 : 1) - floorShown) * Math.min(1, dt * 4);
+    if (floorShown < 0.005) floorShown = 0;
+    floor.visible = glow.visible = key.castShadow = floorShown > 0;
+    shadowMat.opacity = 0.55 * floorShown;
+    glowMat.opacity = floorShown;
+  }
+}
+
+// The arrow points at the battery once it lies on the floor
+const batHint = $('batHint');
+$('batHintText').textContent = (matchMedia('(pointer: coarse)').matches ? 'Tap' : 'Click') + ' the battery to put it back in';
+function updateBatHint() {
+  batHint.hidden = bat.state !== 'floor' || document.body.classList.contains('flat');
+  if (batHint.hidden) return;
+  hintBox.setFromObject(battery);
+  hintBox.getCenter(hintPt).y = hintBox.max.y;
+  hintPt.project(camera);
+  batHint.style.left = ((hintPt.x + 1) / 2) * host.clientWidth + 'px';
+  batHint.style.top = ((1 - hintPt.y) / 2) * host.clientHeight - 6 + 'px';
+}
 
 new GLTFLoader().load('etboy.glb', (gltf) => {
   const board = gltf.scene;
@@ -803,6 +996,8 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
     } else if (o.name === 'power') power = {node: o, rest: o.position.x};
   });
   rig.add(board); // the rig is at rest (identity) until startDrop()
+  boardNode = board;
+  board.add(battery);
   let hit = null;
   if (power) { // the lever is small: an invisible box around it and its travel takes the clicks
     board.updateMatrixWorld(true);
@@ -827,6 +1022,13 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
   if (intro.phase !== 'done') return void raiseBoard();
   const r = renderer.domElement.getBoundingClientRect();
   ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  // the battery only when nothing on the board is in front of it
+  const front = bat.state === 'in' ? boardNode && ray.intersectObject(boardNode, true)[0] : ray.intersectObject(battery, true)[0];
+  if (front && isBattery(front.object)) {
+    controls.enabled = false; // no turning while mashing it
+    renderer.domElement.setPointerCapture(e.pointerId);
+    return void pokeBattery();
+  }
   const hit = ray.intersectObjects([...Object.values(plungers).map((p) => p.node), ...(powerHit ? [powerHit] : [])], false)[0];
   if (hit?.object === powerHit) {
     e.stopPropagation();
@@ -863,6 +1065,11 @@ function toggleView(flat) {
   if (isFlat && intro.phase !== 'done' && intro.phase !== 'wait') finishIntro();
   // the flat view has no switch to point at: the start overlay switches on there
   if (!everOn && !switchOn) overlay.hidden = !isFlat;
+  if (bat.state !== 'in') { // no battery to click in the flat view: its overlay puts it back
+    $('overlayTitle').textContent = 'No battery';
+    $('overlayText').textContent = 'It rattled out of its holder. Click or press any key to put it back in.';
+    overlay.hidden = !isFlat;
+  }
   $('viewBtn').textContent = document.body.classList.contains('flat') ? '3D board' : '2D screen';
   try { localStorage.setItem('etboy-flat', document.body.classList.contains('flat') ? '1' : '0'); } catch {}
   resize();
@@ -872,6 +1079,7 @@ try { if (localStorage.getItem('etboy-flat') === '1') toggleView(true); } catch 
 
 renderer.setAnimationLoop(() => {
   updateIntro(performance.now());
+  updateBattery(performance.now());
   drawScreen();
   screenTex.needsUpdate = true;
   for (const [b, p] of Object.entries(plungers)) p.node.position.z = p.rest - (buttons & BTN[b] ? 0.6 : 0);
@@ -882,6 +1090,7 @@ renderer.setAnimationLoop(() => {
     renderer.render(scene, camera);
   }
   updateHint();
+  updateBatHint();
 });
 </script>
 </body>

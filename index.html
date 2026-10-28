@@ -106,6 +106,31 @@
   @keyframes bob { 50% { transform: translateY(7px); } }
   @keyframes fadein { from { opacity: 0; } }
   @media (prefers-reduced-motion: reduce) { .hint svg, #pickup, .hint { animation: none; } }
+  /* build game: instructions on top of the 3D view, the part's name next to the pointer */
+  #buildPanel {
+    position: absolute; z-index: 2; top: 12px; left: 16px;
+    width: min(380px, calc(100% - 32px));
+    background: #0b0d0fd9; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
+    animation: fadein .4s ease-out;
+  }
+  #buildPanel[hidden], #partTag[hidden] { display: none; }
+  #buildPanel strong { font-size: 15px; }
+  #buildPanel.compact p { display: none; }
+  #buildPanel.compact strong { display: block; margin-bottom: 4px; }
+  #buildPanel p { margin: 4px 0 8px; color: var(--muted); }
+  #buildPanel p b { color: var(--text); font-weight: 600; }
+  .progress { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .progress div { flex: 1; height: 6px; border-radius: 3px; background: var(--key); overflow: hidden; }
+  #buildBar { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  #buildMsg { margin-top: 6px; color: var(--accent); font-weight: 600; min-height: 1.4em; }
+  #buildMsg:empty { display: none; }
+  #partTag {
+    position: absolute; z-index: 2; pointer-events: none; transform: translate(14px, -130%);
+    background: #0b0d0fd9; border: 1px solid var(--accent); border-radius: 6px; padding: 2px 8px;
+    color: var(--accent); font-size: 13px; font-weight: 600; white-space: nowrap;
+  }
+  #buildBtn { border-color: var(--accent); color: var(--accent); }
+  #buildBtn:disabled { opacity: .5; cursor: default; }
   footer {
     display: flex; gap: 18px; flex-wrap: wrap; justify-content: center;
     padding: 8px 16px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px;
@@ -161,6 +186,7 @@
   <span id="status">loading…</span>
   <span class="spacer"></span>
   <div class="tools">
+    <button id="buildBtn" disabled title="Take the board apart and put it together again">Rebuild it!</button>
     <button id="viewBtn" title="Switch between the 3D board and a flat screen (V)">2D screen</button>
     <select id="tint" title="OLED colour">
       <option value="white">White OLED</option>
@@ -176,6 +202,15 @@
 <main>
   <div id="view3d"></div>
   <div id="view2d"><div class="bezel"><canvas id="screen2d" width="128" height="64"></canvas></div></div>
+  <div id="buildPanel" hidden>
+    <strong>Build your ETBoy</strong>
+    <p>Its parts are lying on the floor. <b><span class="clickWord">Click</span> them one by one</b>: each part flies to
+      its place on the board. The battery holder goes on before the battery. When all are on, the board is ready to
+      switch on.</p>
+    <div class="progress"><div><span id="buildBar"></span></div><span id="buildCount"></span></div>
+    <div id="buildMsg"></div>
+  </div>
+  <div id="partTag" hidden></div>
   <div id="pickup" hidden>Click or tap to pick it up</div>
   <div id="hint" class="hint" hidden>
     <div class="note">Press the switch to turn it on<small class="keys">or press P</small></div>
@@ -208,6 +243,7 @@
   <span><kbd>X</kbd> / <kbd>J</kbd> B</span>
   <span><kbd>P</kbd> power switch</span>
   <span>Drag to turn the board, click its buttons and the switch on top</span>
+  <span><b>Rebuild it!</b> takes it apart again</span>
   <span><span id="led"></span>LED</span>
 </footer>
 
@@ -249,6 +285,10 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyP') return void setSwitch(!switchOn);
   if (e.code === 'KeyM') return void toggleMute();
   if (e.code === 'KeyV') return void toggleView();
+  if (intro.phase === 'build') { // any other key puts the next part on
+    e.preventDefault();
+    return void flyNext();
+  }
   if (intro.phase === 'drop' || intro.phase === 'floor') {
     e.preventDefault();
     return void raiseBoard();
@@ -464,6 +504,7 @@ function powerOff(title, text) {
 }
 
 function setSwitch(on) {
+  if (on && build.active) return void buildMessage('Finish building first, then switch it on');
   switchOn = on;
   $('powerBtn').textContent = on ? 'Power off' : 'Power on';
   $('powerBtn').setAttribute('aria-pressed', String(!on));
@@ -612,16 +653,19 @@ const newBody = (e) => ({
   rest: 0, t: 0,
 });
 const body = newBody(RESTITUTION); // the board (the rig)
+const bareBody = newBody(RESTITUTION); // the board without the parts of the build game
+let rigBody = body;
 
-// Called once with the rig at rest: hull points from all vertices, inertia of a uniform box around them
-function buildBody() {
-  rig.updateMatrixWorld(true);
-  const all = [], v = new THREE.Vector3();
-  rig.traverse((o) => {
+// Hull points from all vertices of obj in its own frame, inertia of a uniform box around them
+function buildBody(body, obj) {
+  obj.updateMatrixWorld(true);
+  const all = [], v = new THREE.Vector3(), inv = obj.matrixWorld.clone().invert(), m = new THREE.Matrix4();
+  obj.traverse((o) => {
     if (!o.isMesh) return;
     const pos = o.geometry.attributes.position;
+    m.multiplyMatrices(inv, o.matrixWorld);
     for (let i = 0; i < pos.count; i++) {
-      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      v.fromBufferAttribute(pos, i).applyMatrix4(m);
       all.push(v.x, v.y, v.z);
     }
   });
@@ -644,21 +688,26 @@ function buildBody() {
 }
 
 // Face up above the floor, a little turned and barely tilted, without spin
-function startDrop() {
-  const tilt = () => (Math.random() - 0.5) * 0.06;
-  body.q.setFromEuler(new THREE.Euler(-Math.PI / 2 + BOARD_TILT + tilt(), 0.3 + (Math.random() - 0.5) * 0.3, tilt(), 'YXZ'));
-  let low = Infinity;
-  for (const p of body.pts) low = Math.min(low, p.clone().applyQuaternion(body.q).y);
-  body.x.set(0, FLOOR_Y + DROP_HEIGHT - low, 0);
-  body.v.set(0, 0, 0);
-  body.w.set(0, 0, 0);
-  body.rest = body.t = 0;
-  applyBody();
+function startDrop(yaw = 0.3, x = 0, z = 0) {
+  const tilt = () => (Math.random() - 0.5) * 0.06, b = rigBody;
+  b.q.setFromEuler(new THREE.Euler(-Math.PI / 2 + BOARD_TILT + tilt(), yaw + (Math.random() - 0.5) * 0.3, tilt(), 'YXZ'));
+  placeAbove(b, x, z, DROP_HEIGHT);
+  applyBody(b, rig);
 }
 
-function applyBody() { // rig position from the centre of mass
-  rig.quaternion.copy(body.q);
-  rig.position.copy(body.com).applyQuaternion(body.q).negate().add(body.x);
+// At rest, the body's lowest point the given height above the floor
+function placeAbove(b, x, z, height) {
+  let low = Infinity;
+  for (const p of b.pts) low = Math.min(low, p.clone().applyQuaternion(b.q).y);
+  b.x.set(x, FLOOR_Y + height - low, z);
+  b.v.set(0, 0, 0);
+  b.w.set(0, 0, 0);
+  b.rest = b.t = 0;
+}
+
+function applyBody(b, obj) { // object position from the centre of mass
+  obj.quaternion.copy(b.q);
+  obj.position.copy(b.com).applyQuaternion(b.q).negate().add(b.x);
 }
 
 const _qi = new THREE.Quaternion(), _t = new THREE.Vector3(), _u = new THREE.Vector3();
@@ -732,10 +781,11 @@ function runBody(b, clock, now) {
 
 function startIntro() {
   if (document.body.classList.contains('flat')) return finishIntro();
+  rigBody = body;
   startDrop();
   if (reduceMotion) { // lands at once
     while (!stepBody(body, SIM_DT));
-    applyBody();
+    applyBody(body, rig);
   }
   intro.phase = reduceMotion ? 'floor' : 'drop';
   intro.t0 = performance.now();
@@ -764,8 +814,8 @@ const smooth = (p) => (p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) ** 3 / 2);
 
 function updateIntro(now) {
   if (intro.phase === 'drop') {
-    if (runBody(body, intro, now)) intro.phase = 'floor';
-    applyBody();
+    if (runBody(rigBody, intro, now)) intro.phase = 'floor';
+    applyBody(rigBody, rig);
   } else if (intro.phase === 'raise') {
     const p = Math.min(1, (now - intro.t0) / RAISE_MS), e = smooth(p), f = intro.from;
     rig.position.lerpVectors(f.pos, START_TARGET, e).y += Math.sin(Math.PI * p) * 12; // a little arc
@@ -982,6 +1032,258 @@ function updateBatHint() {
   batHint.style.top = ((1 - hintPt.y) / 2) * host.clientHeight - 6 + 'px';
 }
 
+// ===================================================================================
+// Build game: on the first visit, and with "Rebuild it!", the bare board drops with its parts beside it. A click on
+// a part floats it into its place on the board, which then rises into the start view. "Assemble" does it quickly.
+// ===================================================================================
+
+const BUILT_KEY = 'etboy-built'; // set once the board has been built: later visits start with the finished board
+// the bare board lands behind the parts and is held up there while it is built
+const BUILD_CAM = new THREE.Vector3(0, 120, 290), BUILD_TARGET = new THREE.Vector3(0, FLOOR_Y + 22, 0);
+const BOARD_SPOT = [0, -45], HOVER_POS = new THREE.Vector3(0, FLOOR_Y + 40, -45);
+// the side the latest part goes on faces the viewer
+const HOVER = {
+  front: new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.3, 0, 0)),
+  back: new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.55, Math.PI, 0)),
+};
+const FLY_MS = 1100, POSE_MS = 900, CAM_MS = 900;       // a part to its place, the board turning, the camera
+const AUTO_FLY_MS = 420, AUTO_GAP_MS = 110;             // Assemble: shorter flights one after the other
+// in the order Assemble puts them on; pile: x, z on the floor in front of the bare board
+// clang-format off
+const PART_INFO = [
+  {id: 'display', name: 'Display module', side: 'front', pile: [0, 10]},
+  {id: 'btn_up', name: 'Button up', side: 'front'},
+  {id: 'btn_down', name: 'Button down', side: 'front'},
+  {id: 'btn_left', name: 'Button left', side: 'front'},
+  {id: 'btn_right', name: 'Button right', side: 'front'},
+  {id: 'btn_a', name: 'Button A', side: 'front'},
+  {id: 'btn_b', name: 'Button B', side: 'front'},
+  {id: 'power', name: 'Power switch', side: 'front'},
+  {id: 'holder', name: 'Battery holder', side: 'back', pile: [-58, 8]},
+  {id: 'battery', name: 'AAA battery', side: 'back', pile: [58, 8], needs: 'holder'},
+];
+// clang-format on
+const FRONT_ROW = [-72, -48, -24, 0, 24, 48, 72].map((x) => [x, 46]); // buttons and switch, shuffled each time
+const parts = []; // PART_INFO plus group, body, seat (position on the board), state: on, loose, fly
+const build = {active: false, auto: false, finishing: false, board: 'floor', side: 'front', t0: 0, camFrom: null};
+
+// Moves each part's nodes from the model into a group of its own (at the board's origin); false for an older model
+// without them
+function setupParts(board) {
+  for (const info of PART_INFO) {
+    if (info.id === 'battery') {
+      parts.push({...info, group: battery, body: bat.body, seat: BAT_SEAT, state: 'on'});
+      continue;
+    }
+    const own = info.id === 'display' ? 'screen' : info.id; // the screen quad, a plunger, the slider
+    const nodes = board.children.filter((o) => o.name === own || o.name.startsWith(`part_${info.id}_`));
+    if (nodes.length < 2) return false;
+    const group = new THREE.Group();
+    group.add(...nodes);
+    board.add(group);
+    const b = newBody(0.15);
+    buildBody(b, group);
+    parts.push({...info, group, body: b, seat: new THREE.Vector3(), state: 'on'});
+  }
+  return true;
+}
+const partById = (id) => parts.find((p) => p.id === id);
+
+function partAt() {
+  const loose = parts.filter((p) => p.state === 'loose').map((p) => p.group);
+  for (let o = ray.intersectObjects(loose, true)[0]?.object; o; o = o.parent) {
+    const p = parts.find((p) => p.group === o);
+    if (p) return p;
+  }
+  return null;
+}
+
+let msgTimer = 0;
+function buildMessage(text) {
+  $('buildMsg').textContent = text;
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { $('buildMsg').textContent = ''; }, 2500);
+}
+
+function updateBuildUI() {
+  const on = parts.filter((p) => p.state === 'on').length;
+  $('buildBtn').textContent = build.active ? 'Assemble' : 'Rebuild it!';
+  $('buildBtn').title = build.active ? 'Put all parts on at once' : 'Take the board apart and put it together again';
+  $('buildPanel').hidden = !build.active;
+  // the explanation until the first part is on its way, then only the progress
+  $('buildPanel').classList.toggle('compact', parts.some((p) => p.state !== 'loose'));
+  $('buildCount').textContent = `${on} of ${parts.length} parts`;
+  $('buildBar').style.width = (100 * on) / parts.length + '%';
+}
+for (const el of document.querySelectorAll('.clickWord')) el.textContent = matchMedia('(pointer: coarse)').matches ? 'Tap' : 'Click';
+
+// first: the page has just loaded, the camera starts in the build view
+function startBuild(first) {
+  if (document.body.classList.contains('flat')) toggleView(false);
+  if (switchOn) setSwitch(false);
+  overlay.hidden = true;
+  everOn = false; // the arrow at the switch shows again once it is built
+  const now = performance.now();
+  // a battery lying on the floor joins the pile from there
+  if (bat.state === 'back' || bat.state === 'falling') bat.state = 'floor';
+  bat.shake = bat.kick = 0;
+  floorShown = 0;
+  // the bare board drops in the middle, the parts around it, each from its own height
+  rigBody = bareBody;
+  startDrop(0, ...BOARD_SPOT);
+  const row = FRONT_ROW.slice().sort(() => Math.random() - 0.5);
+  parts.forEach((p, i) => {
+    scene.attach(p.group);
+    const b = p.body;
+    b.q.random();
+    const [x, z] = p.pile ?? row.pop();
+    placeAbove(b, x + (Math.random() - 0.5) * 6, z + (Math.random() - 0.5) * 6, 35 + i * 6);
+    b.w.randomDirection().multiplyScalar(1.2);
+    if (reduceMotion) while (!stepBody(b, SIM_DT));
+    applyBody(b, p.group);
+    p.state = 'loose';
+    p.rest = reduceMotion;
+    p.clock = {t0: now};
+  });
+  bat.state = 'parts';
+  if (reduceMotion) {
+    while (!stepBody(rigBody, SIM_DT));
+    applyBody(rigBody, rig);
+  }
+  Object.assign(build, {active: true, auto: false, finishing: false, board: 'floor', side: 'front', t0: now, nextAt: 0, rest: reduceMotion});
+  build.clock = {t0: now};
+  build.camFrom = first || reduceMotion ? null : {cam: camera.position.clone(), target: controls.target.clone()};
+  if (!build.camFrom) {
+    camera.position.copy(BUILD_CAM);
+    controls.target.copy(BUILD_TARGET);
+  }
+  controls.enabled = !build.camFrom;
+  intro.phase = 'build';
+  floor.visible = glow.visible = key.castShadow = true;
+  shadowMat.opacity = 0.55;
+  glowMat.opacity = 1;
+  $('buildMsg').textContent = '';
+  $('status').textContent = 'in pieces';
+  updateBuildUI();
+}
+
+// A part flies to its place; the board is picked up from the floor and turns the part's side to the viewer
+function flyPart(p, dur = FLY_MS) {
+  if (p.state !== 'loose') return;
+  const needs = p.needs && partById(p.needs);
+  if (needs && needs.state === 'loose') {
+    buildMessage(`The ${needs.name.toLowerCase()} has to go on first`);
+    p.body.v.y += 150; // a little hop: not yet
+    p.body.w.randomDirection().multiplyScalar(3);
+    p.rest = false;
+    return;
+  }
+  const now = performance.now();
+  p.state = 'fly';
+  updateBuildUI();
+  p.t0 = now;
+  p.dur = reduceMotion ? 0 : dur;
+  p.from = {pos: p.group.position.clone(), quat: p.group.quaternion.clone()};
+  if (build.board === 'floor' || build.side !== p.side) {
+    build.poseFrom = {pos: rig.position.clone(), quat: rig.quaternion.clone()};
+    build.poseT0 = now;
+    build.poseMs = reduceMotion ? 0 : build.auto ? AUTO_FLY_MS : POSE_MS;
+    build.board = 'hover';
+    build.side = p.side;
+  }
+}
+
+function flyNext() {
+  const p = parts.find((p) => p.state === 'loose' && (!p.needs || partById(p.needs).state !== 'loose'));
+  if (p) flyPart(p, build.auto ? AUTO_FLY_MS : FLY_MS);
+}
+
+function placePart(p) {
+  if (p.group === battery) seatBattery(); // stays off: the switch is off
+  else {
+    boardNode.add(p.group);
+    p.group.position.copy(p.seat);
+    p.group.quaternion.identity();
+  }
+  p.state = 'on';
+  updateBuildUI();
+}
+
+// Assemble: the remaining parts fly on one after the other
+function assemble() {
+  if (!build.active) return;
+  build.auto = true;
+  build.nextAt = 0;
+}
+$('buildBtn').onclick = () => (build.active ? assemble() : startBuild(false));
+
+// Done: the board rises into the start view
+function endBuild() {
+  build.active = false;
+  rigBody = body;
+  try { localStorage.setItem(BUILT_KEY, '1'); } catch {}
+  $('status').textContent = 'off';
+  updateBuildUI();
+  controls.enabled = false;
+  intro.from = {pos: rig.position.clone(), quat: rig.quaternion.clone(), cam: camera.position.clone(), target: controls.target.clone()};
+  intro.phase = 'raise';
+  intro.t0 = performance.now();
+  if (reduceMotion) finishIntro();
+}
+
+// Everything on at once (the flat view has no board to build on)
+function finishBuildNow() {
+  for (const p of parts) if (p.state !== 'on') placePart(p);
+  endBuild();
+  finishIntro();
+}
+
+const _m = new THREE.Matrix4(), _s = new THREE.Vector3();
+function updateBuild(now) {
+  if (build.camFrom) { // from wherever the camera was into the build view
+    const p = Math.min(1, (now - build.t0) / CAM_MS), e = smooth(p);
+    camera.position.lerpVectors(build.camFrom.cam, BUILD_CAM, e);
+    controls.target.lerpVectors(build.camFrom.target, BUILD_TARGET, e);
+    if (p === 1) {
+      build.camFrom = null;
+      controls.enabled = true;
+    }
+  }
+  if (build.board === 'floor') {
+    if (!build.rest && runBody(rigBody, build.clock, now)) build.rest = true;
+    applyBody(rigBody, rig);
+  } else {
+    const p = build.poseMs ? Math.min(1, (now - build.poseT0) / build.poseMs) : 1, e = smooth(p);
+    rig.position.lerpVectors(build.poseFrom.pos, HOVER_POS, e);
+    rig.quaternion.slerpQuaternions(build.poseFrom.quat, HOVER[build.side], e);
+  }
+  rig.updateMatrixWorld(true);
+  if (build.auto && now >= build.nextAt) {
+    flyNext();
+    build.nextAt = now + AUTO_GAP_MS;
+  }
+  for (const p of parts) {
+    if (p.state === 'loose') {
+      if (!p.rest && runBody(p.body, p.clock, now)) p.rest = true;
+      applyBody(p.body, p.group);
+    } else if (p.state === 'fly') { // up in an arc and into the seat, wherever the board is by now
+      const t = p.dur ? Math.min(1, (now - p.t0) / p.dur) : 1, e = smooth(t);
+      _m.copy(boardNode.matrixWorld).multiply(new THREE.Matrix4().makeTranslation(p.seat));
+      _m.decompose(_p, _q, _s);
+      p.group.position.lerpVectors(p.from.pos, _p, e).y += Math.sin(Math.PI * t) * 30;
+      p.group.quaternion.slerpQuaternions(p.from.quat, _q, e);
+      if (t === 1) placePart(p);
+    }
+  }
+  // all on: a moment to look at it, then up into the start view
+  if (!build.finishing && parts.every((p) => p.state === 'on')) {
+    build.finishing = true;
+    build.doneAt = now;
+    buildMessage('Done! Up it goes…');
+  }
+  if (build.finishing && now - build.doneAt > (build.auto ? 250 : 700)) endBuild();
+}
+
 new GLTFLoader().load('etboy.glb', (gltf) => {
   const board = gltf.scene;
   board.rotation.x = -BOARD_TILT;
@@ -998,6 +1300,7 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
   rig.add(board); // the rig is at rest (identity) until startDrop()
   boardNode = board;
   board.add(battery);
+  const buildable = setupParts(board);
   let hit = null;
   if (power) { // the lever is small: an invisible box around it and its travel takes the clicks
     board.updateMatrixWorld(true);
@@ -1008,9 +1311,18 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
     box.getCenter(powerHit.position);
     hit = powerHit;
   }
-  buildBody(); // without the click box, which reaches below the board
+  buildBody(body, rig); // without the click box, which reaches below the board
+  if (buildable) { // and once without the parts
+    for (const p of parts) board.remove(p.group);
+    buildBody(bareBody, rig);
+    for (const p of parts) board.add(p.group);
+  }
   if (hit) rig.add(hit);
-  startIntro();
+  $('buildBtn').disabled = !buildable;
+  let built = false;
+  try { built = localStorage.getItem(BUILT_KEY) === '1'; } catch {}
+  if (buildable && !built && !document.body.classList.contains('flat')) startBuild(true);
+  else startIntro();
 }, undefined, (err) => {
   console.warn('no 3D model', err);
   toggleView(true);
@@ -1018,10 +1330,22 @@ new GLTFLoader().load('etboy.glb', (gltf) => {
 
 // Click/touch the board's buttons
 const ray = new THREE.Raycaster();
-renderer.domElement.addEventListener('pointerdown', (e) => {
-  if (intro.phase !== 'done') return void raiseBoard();
+function aim(e) {
   const r = renderer.domElement.getBoundingClientRect();
   ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (intro.phase === 'build') {
+    aim(e);
+    const p = partAt();
+    if (!p) return;
+    controls.enabled = false; // a click on a part, not a drag
+    renderer.domElement.setPointerCapture(e.pointerId);
+    $('partTag').hidden = true;
+    return void flyPart(p);
+  }
+  if (intro.phase !== 'done') return void raiseBoard();
+  aim(e);
   // the battery only when nothing on the board is in front of it
   const front = bat.state === 'in' ? boardNode && ray.intersectObject(boardNode, true)[0] : ray.intersectObject(battery, true)[0];
   if (front && isBattery(front.object)) {
@@ -1042,9 +1366,23 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
 });
 const release = (e) => {
   for (const h of held) if (h.startsWith('ptr:' + e.pointerId + ':')) held.delete(h);
-  controls.enabled = intro.phase === 'done';
+  controls.enabled = canOrbit();
   updateButtons();
 };
+const canOrbit = () => intro.phase === 'done' || (intro.phase === 'build' && !build.camFrom);
+// The name of the part under the mouse
+renderer.domElement.addEventListener('pointermove', (e) => {
+  const tag = $('partTag');
+  const p = intro.phase === 'build' && e.pointerType === 'mouse' && !e.buttons ? (aim(e), partAt()) : null;
+  tag.hidden = !p;
+  renderer.domElement.style.cursor = p ? 'pointer' : '';
+  if (!p) return;
+  const r = host.getBoundingClientRect();
+  tag.textContent = p.name;
+  tag.style.left = e.clientX - r.left + 'px';
+  tag.style.top = e.clientY - r.top + 'px';
+});
+renderer.domElement.addEventListener('pointerleave', () => { $('partTag').hidden = true; });
 renderer.domElement.addEventListener('pointerup', release);
 renderer.domElement.addEventListener('pointercancel', release);
 
@@ -1062,6 +1400,7 @@ new ResizeObserver(resize).observe(host);
 function toggleView(flat) {
   document.body.classList.toggle('flat', flat ?? !document.body.classList.contains('flat'));
   const isFlat = document.body.classList.contains('flat');
+  if (isFlat && build.active) finishBuildNow(); // the flat view has no board to build
   if (isFlat && intro.phase !== 'done' && intro.phase !== 'wait') finishIntro();
   // the flat view has no switch to point at: the start overlay switches on there
   if (!everOn && !switchOn) overlay.hidden = !isFlat;
@@ -1079,6 +1418,7 @@ try { if (localStorage.getItem('etboy-flat') === '1') toggleView(true); } catch 
 
 renderer.setAnimationLoop(() => {
   updateIntro(performance.now());
+  if (intro.phase === 'build') updateBuild(performance.now());
   updateBattery(performance.now());
   drawScreen();
   screenTex.needsUpdate = true;

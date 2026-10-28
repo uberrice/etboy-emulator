@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ETBoy Emulator</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="The ETBoy game console in the browser: the real firmware compiled to WebAssembly, on a 3D model of the board.">
+<style>
+  :root {
+    --bg: #101214;
+    --panel: #181b1f;
+    --line: #2a2f35;
+    --text: #e6e8ea;
+    --muted: #8b939c;
+    --accent: #7fd4ff;
+    --key: #23272d;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(ellipse at 50% 35%, #1b2026 0%, var(--bg) 70%);
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in srgb, var(--panel) 85%, transparent);
+    flex-wrap: wrap;
+    z-index: 2;
+  }
+  h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: .02em; }
+  h1 small { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .spacer { flex: 1; }
+  .tools { display: flex; gap: 6px; flex-wrap: wrap; }
+  button, select {
+    font: inherit;
+    color: var(--text);
+    background: var(--key);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+  }
+  button:hover, select:hover { border-color: #3d444c; }
+  button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+  main { position: relative; flex: 1; min-height: 0; }
+  #view3d, #view2d { position: absolute; inset: 0; }
+  #view3d canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #view2d { display: none; align-items: center; justify-content: center; padding: 16px; }
+  body.flat #view3d { display: none; }
+  body.flat #view2d { display: flex; }
+  .bezel {
+    background: #050607;
+    border: 1px solid #22262b;
+    border-radius: 10px;
+    padding: 4% 4%;
+    width: min(100%, 860px, calc((100vh - 220px) * 2.2));
+    box-shadow: 0 20px 60px #0008, inset 0 0 0 1px #0a0b0c;
+  }
+  #screen2d { display: block; width: 100%; aspect-ratio: 2 / 1; image-rendering: pixelated; }
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    background: #0b0d0fcc;
+    text-align: center;
+    padding: 16px;
+    z-index: 3;
+    cursor: pointer;
+  }
+  #overlay[hidden] { display: none; }
+  #overlay .power {
+    width: 72px; height: 72px; border-radius: 50%;
+    border: 2px solid var(--accent); color: var(--accent);
+    display: grid; place-items: center;
+    font-size: 30px;
+  }
+  #overlay p { margin: 0; color: var(--muted); max-width: 420px; }
+  #overlay strong { color: var(--text); font-size: 17px; }
+  footer {
+    display: flex; gap: 18px; flex-wrap: wrap; justify-content: center;
+    padding: 8px 16px; color: var(--muted); border-top: 1px solid var(--line); font-size: 13px;
+  }
+  kbd {
+    font: 12px ui-monospace, monospace;
+    background: var(--key); border: 1px solid var(--line); border-bottom-width: 2px;
+    border-radius: 4px; padding: 1px 5px; color: var(--text);
+  }
+  #led {
+    width: 9px; height: 9px; border-radius: 50%; background: #3a1512; display: inline-block;
+    vertical-align: middle; margin-right: 4px;
+  }
+  #led.on { background: #ff3b2f; box-shadow: 0 0 8px #ff3b2f; }
+  #status { color: var(--muted); font-size: 13px; }
+  /* touch pad, shown on touch screens */
+  #pad { display: none; }
+  @media (pointer: coarse) {
+    #pad {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 10px 22px calc(10px + env(safe-area-inset-bottom));
+      border-top: 1px solid var(--line);
+      touch-action: none;
+    }
+    footer { display: none; }
+  }
+  .dpad { display: grid; grid-template-columns: repeat(3, 52px); grid-template-rows: repeat(3, 52px); gap: 4px; }
+  .dpad span:nth-child(1) { grid-area: 1 / 2; }
+  .dpad span:nth-child(2) { grid-area: 2 / 1; }
+  .dpad span:nth-child(3) { grid-area: 2 / 3; }
+  .dpad span:nth-child(4) { grid-area: 3 / 2; }
+  .ab { display: flex; gap: 14px; align-items: center; }
+  .ab span:last-child { transform: translateY(-18px); }
+  #pad span {
+    display: grid; place-items: center; border-radius: 10px;
+    background: var(--key); border: 1px solid var(--line); font-weight: 600; color: var(--muted);
+  }
+  .ab span { width: 62px; height: 62px; border-radius: 50% !important; }
+  #pad span.down { background: #2f3842; color: var(--accent); border-color: var(--accent); }
+</style>
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+</script>
+</head>
+<body>
+<header>
+  <h1>ETBoy <small>emulator</small></h1>
+  <span id="status">loading…</span>
+  <span class="spacer"></span>
+  <div class="tools">
+    <button id="viewBtn" title="Switch between the 3D board and a flat screen (V)">2D screen</button>
+    <select id="tint" title="OLED colour">
+      <option value="white">White OLED</option>
+      <option value="blue">Blue OLED</option>
+      <option value="duo">Yellow/blue OLED</option>
+    </select>
+    <button id="muteBtn" aria-pressed="false" title="Sound on/off (M)">Sound on</button>
+    <button id="powerBtn" aria-pressed="false" title="Power switch (P)">Power off</button>
+    <button id="resetBtn" title="Switch off and on again (R)">Restart</button>
+  </div>
+</header>
+
+<main>
+  <div id="view3d"></div>
+  <div id="view2d"><div class="bezel"><canvas id="screen2d" width="128" height="64"></canvas></div></div>
+  <div id="overlay">
+    <div class="power">⏻</div>
+    <strong id="overlayTitle">Switch on</strong>
+    <p id="overlayText">Click or press any key, or use the power switch on top of the board (P). The real firmware runs here, compiled to WebAssembly: menu, all games,
+      high scores (kept in this browser).</p>
+  </div>
+</main>
+
+<div id="pad" aria-hidden="true">
+  <div class="dpad"><span data-btn="up">▲</span><span data-btn="left">◀</span><span data-btn="right">▶</span><span data-btn="down">▼</span></div>
+  <div class="ab"><span data-btn="b">B</span><span data-btn="a">A</span></div>
+</div>
+
+<footer>
+  <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / <kbd>↑</kbd><kbd>←</kbd><kbd>↓</kbd><kbd>→</kbd> D-pad</span>
+  <span><kbd>C</kbd> / <kbd>K</kbd> A</span>
+  <span><kbd>X</kbd> / <kbd>J</kbd> B</span>
+  <span><kbd>P</kbd> power switch</span>
+  <span>Drag to turn the board, click its buttons and the switch on top</span>
+  <span><span id="led"></span>LED</span>
+</footer>
+
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+import createFirmware from './firmware.js';
+
+// ===================================================================================
+// Buttons: bits as in emu.c
+// ===================================================================================
+
+const BTN = {up: 1, down: 2, left: 4, right: 8, a: 16, b: 32};
+const KEYS = {
+  KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down', KeyA: 'left', ArrowLeft: 'left',
+  KeyD: 'right', ArrowRight: 'right', KeyC: 'a', KeyK: 'a', KeyX: 'b', KeyJ: 'b',
+};
+const held = new Set();      // keys and pointers currently holding a button: "key:KeyW", "ptr:3:a"
+const ignored = new Set();   // keys still down from switching on, ignored until released
+let buttons = 0;
+
+function updateButtons() {
+  buttons = 0;
+  for (const h of held) buttons |= BTN[h.split(':').pop()];
+  fw?._emu_set_buttons(buttons);
+  for (const el of document.querySelectorAll('#pad span')) el.classList.toggle('down', !!(buttons & BTN[el.dataset.btn]));
+}
+
+const $ = (id) => document.getElementById(id);
+const overlay = $('overlay');
+let fw = null, poweredOff = true, booting = false, generation = 0;
+let switchOn = false; // position of the power switch; the auto shutdown switches off with it still on
+
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
+  if (e.code === 'KeyP') return void setSwitch(!switchOn);
+  if (e.code === 'KeyM') return void toggleMute();
+  if (e.code === 'KeyV') return void toggleView();
+  if (poweredOff) {
+    // any key switches on from the start screen and after the auto shutdown, not when switched off by hand
+    if (overlay.hidden || e.target.closest('select')) return;
+    e.preventDefault();
+    ignored.add(e.code);
+    wake();
+    return;
+  }
+  if (e.code === 'KeyR') return void restart();
+  const b = KEYS[e.code];
+  if (!b || ignored.has(e.code)) return;
+  e.preventDefault();
+  held.add('key:' + e.code + ':' + b);
+  updateButtons();
+});
+addEventListener('keyup', (e) => {
+  ignored.delete(e.code);
+  const b = KEYS[e.code];
+  if (b && held.delete('key:' + e.code + ':' + b)) updateButtons();
+});
+addEventListener('blur', () => { held.clear(); updateButtons(); });
+
+for (const el of document.querySelectorAll('#pad span')) {
+  el.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    held.add('ptr:' + e.pointerId + ':' + el.dataset.btn);
+    updateButtons();
+  });
+  const up = (e) => { if (held.delete('ptr:' + e.pointerId + ':' + el.dataset.btn)) updateButtons(); };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+}
+
+// ===================================================================================
+// Audio: the firmware pushes 1-bit buzzer samples, a worklet queues and filters them
+// ===================================================================================
+
+// The queue and filter run in an AudioWorklet where available. Pages on plain http:// from another machine (a phone
+// opening the PC's LAN address) are no secure context and have no AudioWorklet: a ScriptProcessorNode runs the same
+// code there.
+const BUZZER = `
+class BuzzerQueue {
+  constructor(rate) {
+    this.rate = rate; this.q = []; this.cur = null; this.pos = 0; this.queued = 0;
+    this.hp = 0; this.prevIn = 0; this.lp = 0; this.gain = 0.3; this.started = false;
+  }
+  push(d) {
+    this.q.push(d); this.queued += d.length;
+    while (this.queued > this.rate * 0.25 && this.q.length > 1) this.queued -= this.q.shift().length;   // fell behind: drop
+    if (!this.started && this.queued >= this.rate * 0.06) this.started = true;
+  }
+  fill(out) {
+    for (let i = 0; i < out.length; i++) {
+      let x = this.prevIn;
+      if (this.started) {
+        if (!this.cur || this.pos >= this.cur.length) { this.cur = this.q.shift(); this.pos = 0; }
+        if (this.cur) { x = this.cur[this.pos++]; this.queued--; } else this.started = false;   // underrun: re-buffer
+      }
+      this.hp = 0.995 * (this.hp + x - this.prevIn);   // DC blocker
+      this.prevIn = x;
+      this.lp += 0.45 * (this.hp - this.lp);            // takes the edge off the square waves
+      out[i] = this.lp * this.gain;
+    }
+  }
+}`;
+const WORKLET = BUZZER + `
+class Buzzer extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.b = new BuzzerQueue(sampleRate);
+    this.port.onmessage = (e) => { if (typeof e.data === 'number') this.b.gain = e.data; else this.b.push(e.data); };
+  }
+  process(inputs, outputs) { this.b.fill(outputs[0][0]); return true; }
+}
+registerProcessor('buzzer', Buzzer);`;
+
+let audio = null, buzzer = null, muted = false; // buzzer: {push(samples), gain(g)}
+try { muted = localStorage.getItem('etboy-muted') === '1'; } catch {}
+
+async function workletBuzzer() {
+  await audio.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], {type: 'text/javascript'})));
+  const node = new AudioWorkletNode(audio, 'buzzer');
+  node.connect(audio.destination);
+  return {push: (d) => node.port.postMessage(d, [d.buffer]), gain: (g) => node.port.postMessage(g)};
+}
+
+function scriptBuzzer() {
+  const q = new (new Function(BUZZER + 'return BuzzerQueue;')())(audio.sampleRate);
+  const node = audio.createScriptProcessor(2048, 1, 1);
+  node.onaudioprocess = (e) => q.fill(e.outputBuffer.getChannelData(0));
+  node.connect(audio.destination);
+  return {push: (d) => q.push(d), gain: (g) => { q.gain = g; }, node};
+}
+
+// Called from the gesture that switches on: the context has to be made and started inside a user gesture
+async function startAudio() {
+  if (audio) return void unlockAudio(); // not awaited: resume() only settles after a gesture that allows audio
+  try {
+    audio = new AudioContext({latencyHint: 'interactive'});
+  } catch (err) {
+    console.warn('no audio', err);
+    return showMute();
+  }
+  audio.onstatechange = showMute;
+  unlockAudio();
+  try {
+    // a worklet that does not load within 2 s counts as missing
+    buzzer = audio.audioWorklet ? await Promise.race([workletBuzzer(), new Promise((_, no) => setTimeout(no, 2000))]) : null;
+  } catch (err) {
+    console.warn('no AudioWorklet, using ScriptProcessorNode', err);
+  }
+  buzzer ||= scriptBuzzer();
+  buzzer.gain(muted ? 0 : 0.3);
+  showMute();
+}
+
+// Touch screens only allow audio from a touch that ends (pointerup, touchend, click), not from the pointerdown that
+// switches the board on, so every gesture tries again until the context runs
+function unlockAudio() {
+  if (!audio || audio.state === 'running') return;
+  audio.resume().then(showMute, () => {});
+  const b = audio.createBuffer(1, 1, audio.sampleRate), src = audio.createBufferSource(); // a silent blip unlocks too
+  src.buffer = b;
+  src.connect(audio.destination);
+  src.start();
+}
+for (const ev of ['pointerup', 'touchend', 'click', 'keydown']) addEventListener(ev, unlockAudio, {capture: true});
+
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('etboy-muted', muted ? '1' : '0'); } catch {}
+  buzzer?.gain(muted ? 0 : 0.3);
+  showMute();
+}
+// The button also tells when the browser holds the sound back
+function showMute() {
+  const blocked = audio && audio.state !== 'running' && !poweredOff;
+  $('muteBtn').textContent = muted ? 'Sound off' : !audio && !poweredOff ? 'No sound' : blocked ? 'Tap for sound' : 'Sound on';
+  $('muteBtn').setAttribute('aria-pressed', String(muted));
+}
+showMute();
+$('muteBtn').onclick = () => (audio && audio.state !== 'running' && !muted ? unlockAudio() : toggleMute());
+
+// ===================================================================================
+// Firmware instance: one per power-on (a switched-off instance stays parked)
+// ===================================================================================
+
+const SAVE_KEY = 'etboy-save';
+
+async function powerOn() {
+  if (booting || !switchOn) return;
+  booting = true;
+  overlay.hidden = true;
+  $('status').textContent = 'booting';
+  await startAudio();
+  const gen = ++generation; // callbacks of an older, switched-off instance are ignored
+  const inst = await createFirmware({
+    onRuntimeInitialized() { if (audio) this._emu_set_sample_rate(audio.sampleRate); },
+    onAudio(ptr, n) {
+      if (gen !== generation || !buzzer) return;
+      buzzer.push(this.HEAPF32.slice(ptr >> 2, (ptr >> 2) + n));
+    },
+    onFlashLoad(dst, len) {
+      try {
+        const s = localStorage.getItem(SAVE_KEY);
+        if (s) this.HEAPU8.set(Uint8Array.from(atob(s), (c) => c.charCodeAt(0)).subarray(0, len), dst);
+      } catch {}
+    },
+    onFlashStore(src, len) {
+      try { localStorage.setItem(SAVE_KEY, btoa(String.fromCharCode(...this.HEAPU8.subarray(src, src + len)))); } catch {}
+    },
+    onPowerOff() {
+      if (gen !== generation) return;
+      powerOff('Switched itself off', 'No button for 5 minutes: the power latch let go, just like on the device. Click or press any key to switch on again.');
+    },
+  });
+  booting = false;
+  if (!switchOn) { // switched off again while booting
+    inst._emu_power_off();
+    generation++;
+    return;
+  }
+  fw = inst;
+  poweredOff = false;
+  updateButtons();
+  showMute();
+  $('status').textContent = 'running';
+}
+
+// title: shows the overlay (auto shutdown); without, the board just goes dark (power switch)
+function powerOff(title, text) {
+  fw?._emu_power_off();
+  generation++;
+  fw = null;
+  poweredOff = true;
+  held.clear();
+  updateButtons();
+  if (title) {
+    $('overlayTitle').textContent = title;
+    $('overlayText').textContent = text;
+    overlay.hidden = false;
+  }
+  $('status').textContent = 'off';
+  showMute();
+}
+
+function setSwitch(on) {
+  switchOn = on;
+  $('powerBtn').textContent = on ? 'Power off' : 'Power on';
+  $('powerBtn').setAttribute('aria-pressed', String(!on));
+  if (on) powerOn();
+  else {
+    overlay.hidden = true;
+    powerOff();
+  }
+}
+
+// From the overlay: flips the switch on, or starts again after the auto shutdown (switch still on)
+function wake() {
+  if (switchOn) powerOn();
+  else setSwitch(true);
+}
+
+function restart() {
+  powerOff();
+  powerOn();
+}
+$('powerBtn').onclick = () => setSwitch(!switchOn);
+$('resetBtn').onclick = () => { if (!poweredOff) restart(); };
+overlay.addEventListener('pointerdown', (e) => { e.preventDefault(); wake(); });
+setSwitch(false);
+overlay.hidden = false;
+
+// ===================================================================================
+// Screen: 128x64 from the emulated SSD1306, tinted like the different OLED modules
+// ===================================================================================
+
+const TINTS = {
+  white: () => [225, 240, 255],
+  blue: () => [80, 190, 255],
+  duo: (y) => (y < 16 ? [255, 214, 40] : [80, 190, 255]),
+};
+let tint = 'white';
+try { tint = localStorage.getItem('etboy-tint') || 'white'; } catch {}
+$('tint').value = tint;
+$('tint').onchange = (e) => { tint = e.target.value; try { localStorage.setItem('etboy-tint', tint); } catch {} };
+
+const scr = document.createElement('canvas');
+scr.width = 128;
+scr.height = 64;
+const sctx = scr.getContext('2d');
+const img = sctx.createImageData(128, 64);
+const screen2d = $('screen2d').getContext('2d');
+const DARK = [6, 8, 10];
+
+function drawScreen() {
+  const px = fw ? fw.HEAPU8.subarray(fw._emu_display(), fw._emu_display() + 128 * 64) : null;
+  for (let y = 0; y < 64; y++) {
+    const c = TINTS[tint](y);
+    for (let x = 0; x < 128; x++) {
+      const v = px ? px[y * 128 + x] / 255 : 0, i = (y * 128 + x) * 4;
+      for (let k = 0; k < 3; k++) img.data[i + k] = DARK[k] + (c[k] - DARK[k]) * v;
+      img.data[i + 3] = 255;
+    }
+  }
+  sctx.putImageData(img, 0, 0);
+  screen2d.drawImage(scr, 0, 0);
+  $('led').classList.toggle('on', !!fw?._emu_led());
+}
+
+// ===================================================================================
+// 3D board
+// ===================================================================================
+
+const host = $('view3d');
+const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.85;
+host.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.6;
+const camera = new THREE.PerspectiveCamera(30, 1, 10, 1500);
+camera.position.set(0, -32, 165);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.minDistance = 60;
+controls.maxDistance = 500;
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(-60, 80, 120);
+scene.add(key, new THREE.AmbientLight(0xffffff, 0.25));
+
+const screenTex = new THREE.CanvasTexture(scr);
+screenTex.magFilter = THREE.NearestFilter;
+screenTex.minFilter = THREE.LinearFilter;
+screenTex.colorSpace = THREE.SRGBColorSpace;
+const plungers = {};
+let ledMat = null, power = null, powerHit = null;
+const POWER_TRAVEL = 1.5; // mm the slider moves from off (its position in the model) to on
+
+new GLTFLoader().load('etboy.glb', (gltf) => {
+  const board = gltf.scene;
+  board.rotation.x = -0.12;
+  board.traverse((o) => {
+    if (o.name === 'screen') o.material = new THREE.MeshBasicMaterial({map: screenTex, toneMapped: false});
+    else if (o.name === 'led') ledMat = o.material = o.material.clone();
+    else if (o.name.startsWith('btn_')) {
+      const b = o.name.slice(4);
+      plungers[b] = {node: o, rest: o.position.z};
+      o.userData.btn = b;
+    } else if (o.name === 'power') power = {node: o, rest: o.position.x};
+  });
+  scene.add(board);
+  if (power) { // the lever is small: an invisible box around it and its travel takes the clicks
+    board.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(power.node).expandByScalar(2.5);
+    box.min.x -= POWER_TRAVEL;
+    box.max.x += POWER_TRAVEL;
+    powerHit = new THREE.Mesh(new THREE.BoxGeometry(...box.getSize(new THREE.Vector3()).toArray()), new THREE.MeshBasicMaterial({visible: false}));
+    box.getCenter(powerHit.position);
+    scene.add(powerHit);
+  }
+}, undefined, (err) => {
+  console.warn('no 3D model', err);
+  toggleView(true);
+});
+
+// Click/touch the board's buttons
+const ray = new THREE.Raycaster();
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+  const hit = ray.intersectObjects([...Object.values(plungers).map((p) => p.node), ...(powerHit ? [powerHit] : [])], false)[0];
+  if (hit?.object === powerHit) {
+    e.stopPropagation();
+    return void setSwitch(!switchOn);
+  }
+  if (!hit || poweredOff) return;
+  controls.enabled = false;
+  renderer.domElement.setPointerCapture(e.pointerId);
+  held.add('ptr:' + e.pointerId + ':' + hit.object.userData.btn);
+  updateButtons();
+});
+const release = (e) => {
+  for (const h of held) if (h.startsWith('ptr:' + e.pointerId + ':')) held.delete(h);
+  controls.enabled = true;
+  updateButtons();
+};
+renderer.domElement.addEventListener('pointerup', release);
+renderer.domElement.addEventListener('pointercancel', release);
+
+function resize() {
+  const w = host.clientWidth, h = host.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  // keep the whole board in view on narrow screens
+  camera.fov = w / h < 1.2 ? 30 * Math.min(2.2, 1.2 / (w / h)) : 30;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(host);
+
+function toggleView(flat) {
+  document.body.classList.toggle('flat', flat ?? !document.body.classList.contains('flat'));
+  $('viewBtn').textContent = document.body.classList.contains('flat') ? '3D board' : '2D screen';
+  try { localStorage.setItem('etboy-flat', document.body.classList.contains('flat') ? '1' : '0'); } catch {}
+  resize();
+}
+$('viewBtn').onclick = () => toggleView();
+try { if (localStorage.getItem('etboy-flat') === '1') toggleView(true); } catch {}
+
+renderer.setAnimationLoop(() => {
+  drawScreen();
+  screenTex.needsUpdate = true;
+  for (const [b, p] of Object.entries(plungers)) p.node.position.z = p.rest - (buttons & BTN[b] ? 0.6 : 0);
+  if (power) power.node.position.x += (power.rest + (switchOn ? POWER_TRAVEL : 0) - power.node.position.x) * 0.35;
+  if (ledMat) ledMat.emissive.setRGB(fw?._emu_led() ? 1 : 0, 0, 0);
+  if (!document.body.classList.contains('flat')) {
+    controls.update();
+    renderer.render(scene, camera);
+  }
+});
+</script>
+</body>
+</html>

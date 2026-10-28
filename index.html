@@ -28,6 +28,7 @@
     overflow: hidden;
     -webkit-user-select: none;
     user-select: none;
+    -webkit-touch-callout: none; /* no long-press menu on iOS */
   }
   header {
     display: flex;
@@ -237,6 +238,9 @@ addEventListener('keyup', (e) => {
   if (b && held.delete('key:' + e.code + ':' + b)) updateButtons();
 });
 addEventListener('blur', () => { held.clear(); updateButtons(); });
+
+// a held touch button must not open the browser's long-press menu
+addEventListener('contextmenu', (e) => { if (e.target.closest('#pad, canvas')) e.preventDefault(); });
 
 for (const el of document.querySelectorAll('#pad span')) {
   el.addEventListener('pointerdown', (e) => {

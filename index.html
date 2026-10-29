@@ -124,6 +124,13 @@
   #buildBar { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
   #buildMsg { margin-top: 6px; color: var(--accent); font-weight: 600; min-height: 1.4em; }
   #buildMsg:empty { display: none; }
+  /* phones: once a part is picked up, only a thin progress bar stays */
+  @media (pointer: coarse), (max-width: 600px) {
+    #buildPanel.mini { padding: 6px 10px; width: min(220px, calc(100% - 32px)); }
+    #buildPanel.mini strong, #buildPanel.mini p { display: none; }
+    #buildPanel.mini .progress { font-size: 12px; gap: 8px; }
+    #buildPanel.mini #buildMsg { font-size: 12px; margin-top: 4px; }
+  }
   #partTag {
     position: absolute; z-index: 2; pointer-events: none; transform: translate(14px, -130%);
     background: #0b0d0fd9; border: 1px solid var(--accent); border-radius: 6px; padding: 2px 8px;
@@ -1340,6 +1347,7 @@ function updateBuildUI() {
   $('buildPanel').hidden = !build.active;
   // the explanation until the first part is on, then only the progress
   $('buildPanel').classList.toggle('compact', on > 0);
+  $('buildPanel').classList.toggle('mini', on > 0 || build.touched); // phones only, see the CSS
   $('buildCount').textContent = `${on} of ${parts.length} parts`;
   $('buildBar').style.width = (100 * on) / parts.length + '%';
 }
@@ -1405,7 +1413,7 @@ function startBuild(first) {
     applyBody(rigBody, rig);
   }
   for (const p of parts) applyBody(p.body, p.group);
-  Object.assign(build, {active: true, auto: false, finishing: false, board: 'floor', side: 'front', t0: now, nextAt: 0, rest: reduceMotion, drag: null, hover: null, last: now});
+  Object.assign(build, {active: true, auto: false, finishing: false, board: 'floor', side: 'front', t0: now, nextAt: 0, rest: reduceMotion, drag: null, hover: null, touched: false, last: now});
   build.boardClock = {t0: now};
   build.camFrom = first || reduceMotion ? null : {cam: camera.position.clone(), target: controls.target.clone()};
   if (!build.camFrom) {
@@ -1474,6 +1482,10 @@ function startDrag(p, e) {
   build.drag = {part: p, id: e.pointerId, x: e.clientX, y: e.clientY, ndc: new THREE.Vector2(), moved: false, seat: null, touch: e.pointerType !== 'mouse'};
   dragTo(e);
   p.state = 'drag';
+  if (!build.touched) {
+    build.touched = true;
+    updateBuildUI();
+  }
   renderer.domElement.style.cursor = 'grabbing';
   wakeParts();
   turnBoard(p.side);

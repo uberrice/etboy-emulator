@@ -204,9 +204,9 @@
   <div id="view2d"><div class="bezel"><canvas id="screen2d" width="128" height="64"></canvas></div></div>
   <div id="buildPanel" hidden>
     <strong>Build your ETBoy</strong>
-    <p>Its parts are lying on the floor. <b><span class="clickWord">Click</span> them one by one</b>: each part flies to
-      its place on the board. The battery holder goes on before the battery. When all are on, the board is ready to
-      switch on.</p>
+    <p>Its parts are in the red box. <b>Drag them onto the board</b> one by one, each onto its marker. The six push
+      buttons are all the same, any of them fits any button's place. The battery holder goes on before the battery.
+      When all are on, the board is ready to switch on.</p>
     <div class="progress"><div><span id="buildBar"></span></div><span id="buildCount"></span></div>
     <div id="buildMsg"></div>
   </div>
@@ -615,7 +615,7 @@ renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 key.castShadow = true;
 key.shadow.mapSize.set(2048, 2048);
-Object.assign(key.shadow.camera, {left: -110, right: 110, top: 110, bottom: -110, near: 10, far: 500});
+Object.assign(key.shadow.camera, {left: -170, right: 170, top: 170, bottom: -170, near: 10, far: 500}); // with the parts box
 const shadowMat = new THREE.ShadowMaterial({opacity: 0.55});
 const floor = new THREE.Mesh(new THREE.PlaneGeometry(800, 800), shadowMat);
 floor.rotation.x = -Math.PI / 2;
@@ -637,27 +637,35 @@ scene.add(floor, glow);
 // ===================================================================================
 // Drop physics: the board as a rigid body falling onto the floor. Its contact points are the extreme vertices of
 // the model (an approximate convex hull), so it lands on the battery holder and tips over onto the PCB's edge.
+// The build game's parts also knock into each other: one body's contact points against the other's box.
 // ===================================================================================
 
 const GRAVITY = 1200;           // mm/s², slow motion: an eighth of the real thing
 const RESTITUTION = 0.12, FRICTION = 0.6;
-const CONTACT_DAMPING = 0.985;  // per step while touching the floor: settles softly instead of rolling over
+const CONTACT_DAMPING = 0.985;  // per step while touching something: settles softly instead of rolling over
 const SIM_DT = 1 / 240;
 const SLOW_MOTION = 0.6;        // simulated seconds per real second
 const newBody = (e) => ({
   x: new THREE.Vector3(), q: new THREE.Quaternion(), v: new THREE.Vector3(), w: new THREE.Vector3(),
-  com: new THREE.Vector3(), // centre of mass in the body's frame
+  com: new THREE.Vector3(), // centre of mass in the body's frame, the centre of its box
+  half: new THREE.Vector3(), // half the size of its box, body axes
+  rad: 0,                   // the farthest contact point from the centre
   pts: [],                  // contact points relative to the centre of mass, body's frame
+  invM: 1,                  // inverse mass
   invI: new THREE.Vector3(), // inverse inertia, principal axes = body axes
   e,                        // restitution
   rest: 0, t: 0,
+  r: [], fix: new THREE.Vector3(), touch: false, // per step: contact points turned into the world, push out, any contact
 });
 const body = newBody(RESTITUTION); // the board (the rig)
 const bareBody = newBody(RESTITUTION); // the board without the parts of the build game
 let rigBody = body;
+// half-spaces the bodies stay in: points p with n·p >= d
+const FLOOR_ONLY = [{n: new THREE.Vector3(0, 1, 0), d: FLOOR_Y}];
 
-// Hull points from all vertices of obj in its own frame, inertia of a uniform box around them
-function buildBody(body, obj) {
+// Hull points from all vertices of obj in its own frame (the most extreme one in each of n directions), inertia of a
+// uniform box around them
+function buildBody(body, obj, n = 300) {
   obj.updateMatrixWorld(true);
   const all = [], v = new THREE.Vector3(), inv = obj.matrixWorld.clone().invert(), m = new THREE.Matrix4();
   obj.traverse((o) => {
@@ -671,9 +679,10 @@ function buildBody(body, obj) {
   });
   const box = new THREE.Box3().setFromArray(all), size = box.getSize(new THREE.Vector3());
   box.getCenter(body.com);
-  const picked = new Set(), N = 300;
-  for (let k = 0; k < N; k++) { // the most extreme vertex in each of N directions (Fibonacci sphere)
-    const y = 1 - (2 * (k + 0.5)) / N, r = Math.sqrt(1 - y * y), a = k * 2.39996;
+  body.half.copy(size).multiplyScalar(0.5);
+  const picked = new Set();
+  for (let k = 0; k < n; k++) { // Fibonacci sphere
+    const y = 1 - (2 * (k + 0.5)) / n, r = Math.sqrt(1 - y * y), a = k * 2.39996;
     const dx = Math.cos(a) * r, dz = Math.sin(a) * r;
     let best = 0, bestDot = -Infinity;
     for (let i = 0; i < all.length; i += 3) {
@@ -683,8 +692,14 @@ function buildBody(body, obj) {
     picked.add(best);
   }
   body.pts = [...picked].map((i) => new THREE.Vector3(all[i], all[i + 1], all[i + 2]).sub(body.com));
+  body.rad = Math.max(...body.pts.map((p) => p.length()));
   const [a, b, c] = [size.x ** 2, size.y ** 2, size.z ** 2];
-  body.invI.set(12 / (b + c), 12 / (a + c), 12 / (a + b)); // mass 1
+  body.invI.set(12 / (b + c), 12 / (a + c), 12 / (a + b)).multiplyScalar(body.invM);
+}
+
+function setMass(b, m) { // inertia scales along
+  b.invI.multiplyScalar(1 / (b.invM * m));
+  b.invM = 1 / m;
 }
 
 // Face up above the floor, a little turned and barely tilted, without spin
@@ -710,74 +725,158 @@ function applyBody(b, obj) { // object position from the centre of mass
   obj.position.copy(b.com).applyQuaternion(b.q).negate().add(b.x);
 }
 
-const _qi = new THREE.Quaternion(), _t = new THREE.Vector3(), _u = new THREE.Vector3();
+function bodyFrom(b, obj) { // the other way round, at rest
+  b.q.copy(obj.quaternion);
+  b.x.copy(b.com).applyQuaternion(b.q).add(obj.position);
+  b.v.set(0, 0, 0);
+  b.w.set(0, 0, 0);
+  b.rest = b.t = 0;
+}
+
+const _qi = new THREE.Quaternion(), _t = new THREE.Vector3(), _u = new THREE.Vector3(), _rn = new THREE.Vector3();
 function invInertia(b, vec, out) { // world inverse inertia times vec
   _qi.copy(b.q).invert();
   out.copy(vec).applyQuaternion(_qi).multiply(b.invI).applyQuaternion(b.q);
   return out;
 }
 
-// One step of a small impulse solver: gravity, then contacts with the floor (sequential impulses with friction)
-function stepBody(b, dt) {
-  const {x, q, v, w} = b;
-  v.y -= GRAVITY * dt;
-  x.addScaledVector(v, dt);
-  const dq = new THREE.Quaternion(w.x * dt / 2, w.y * dt / 2, w.z * dt / 2, 0).multiply(q);
-  q.set(q.x + dq.x, q.y + dq.y, q.z + dq.z, q.w + dq.w).normalize();
+// A contact of body a at its offset ra (world axes) with b (null: a half-space), n pushing a out
+function relVel(c, out) {
+  out.crossVectors(c.a.w, c.ra).add(c.a.v);
+  if (c.b) out.sub(_t.crossVectors(c.b.w, c.rb).add(c.b.v));
+  return out;
+}
+function kAlong(c, dir) { // inverse effective mass along dir
+  let k = c.a.invM + invInertia(c.a, _rn.crossVectors(c.ra, dir), _u).cross(c.ra).dot(dir);
+  if (c.b) k += c.b.invM + invInertia(c.b, _rn.crossVectors(c.rb, dir), _u).cross(c.rb).dot(dir);
+  return k;
+}
+function push(c, imp) { // impulse on a, the opposite on b
+  c.a.v.addScaledVector(imp, c.a.invM);
+  c.a.w.add(invInertia(c.a, _rn.crossVectors(c.ra, imp), _t));
+  if (!c.b) return;
+  c.b.v.addScaledVector(imp, -c.b.invM);
+  c.b.w.sub(invInertia(c.b, _rn.crossVectors(c.rb, imp), _t));
+}
+const _vp = new THREE.Vector3();
+function addContact(contacts, a, b, ra, n) {
+  const c = {a, b, ra, rb: b && new THREE.Vector3().copy(a.x).add(ra).sub(b.x), n, acc: 0, accT: new THREE.Vector3()};
+  const vn = relVel(c, _vp).dot(n);
+  c.target = vn < -150 ? -(b ? Math.min(a.e, b.e) : a.e) * vn : 0;
+  c.k = kAlong(c, n);
+  a.touch = true;
+  if (b) b.touch = true;
+  contacts.push(c);
+}
 
-  const contacts = [];
-  let pen = 0;
-  for (const p of b.pts) {
-    const r = p.clone().applyQuaternion(q);
-    const depth = FLOOR_Y - (x.y + r.y);
-    if (depth <= 0) continue;
-    pen = Math.max(pen, depth);
-    const vn = v.y + (w.z * r.x - w.x * r.z); // (w × r).y
-    contacts.push({r, acc: 0, accT: new THREE.Vector3(), target: vn < -150 ? -b.e * vn : 0});
+// a's contact points inside b's box, each pushed out through the nearest face
+const _l = new THREE.Vector3(), _qb = new THREE.Quaternion(), _dn = new THREE.Vector3();
+function boxContacts(contacts, a, b) {
+  _qb.copy(b.q).invert();
+  let deepest = 0;
+  for (const r of a.r) {
+    _l.copy(a.x).add(r).sub(b.x).applyQuaternion(_qb);
+    const dx = b.half.x - Math.abs(_l.x), dy = b.half.y - Math.abs(_l.y), dz = b.half.z - Math.abs(_l.z);
+    if (dx <= 0 || dy <= 0 || dz <= 0) continue;
+    const n = new THREE.Vector3();
+    if (dx <= dy && dx <= dz) n.x = Math.sign(_l.x) || 1;
+    else if (dy <= dz) n.y = Math.sign(_l.y) || 1;
+    else n.z = Math.sign(_l.z) || 1;
+    n.applyQuaternion(b.q);
+    addContact(contacts, a, b, r, n);
+    const depth = Math.min(dx, dy, dz);
+    if (depth > deepest) {
+      deepest = depth;
+      _dn.copy(n);
+    }
   }
-  const n = new THREE.Vector3(0, 1, 0), vp = new THREE.Vector3(), rn = new THREE.Vector3();
-  const kAlong = (r, dir) => 1 + invInertia(b, rn.crossVectors(r, dir), _u).cross(r).dot(dir);
+  if (!deepest) return;
+  const share = (deepest * 0.8) / (a.invM + b.invM); // out of each other, the lighter one moving more
+  a.fix.addScaledVector(_dn, share * a.invM);
+  b.fix.addScaledVector(_dn, -share * b.invM);
+}
+
+// One step of a small impulse solver: gravity, then contacts with the half-spaces and, with collide, between the
+// bodies (sequential impulses with friction). True once all bodies are at rest.
+function stepBodies(bodies, planes, dt, collide = false) {
+  for (const b of bodies) {
+    const {x, q, v, w} = b;
+    v.y -= GRAVITY * dt;
+    x.addScaledVector(v, dt);
+    const dq = new THREE.Quaternion(w.x * dt / 2, w.y * dt / 2, w.z * dt / 2, 0).multiply(q);
+    q.set(q.x + dq.x, q.y + dq.y, q.z + dq.z, q.w + dq.w).normalize();
+    while (b.r.length < b.pts.length) b.r.push(new THREE.Vector3());
+    b.pts.forEach((p, i) => b.r[i].copy(p).applyQuaternion(q));
+    b.r.length = b.pts.length;
+    b.fix.set(0, 0, 0);
+    b.touch = false;
+  }
+  const contacts = [];
+  for (const b of bodies)
+    for (const pl of planes) {
+      let pen = 0;
+      for (const r of b.r) {
+        const depth = pl.d - pl.n.dot(_l.copy(b.x).add(r));
+        if (depth <= 0) continue;
+        pen = Math.max(pen, depth);
+        addContact(contacts, b, null, r, pl.n);
+      }
+      b.fix.addScaledVector(pl.n, pen * 0.8); // out of the half-space
+    }
+  if (collide)
+    for (let i = 0; i < bodies.length; i++)
+      for (let j = i + 1; j < bodies.length; j++) {
+        const a = bodies[i], b = bodies[j];
+        if (a.x.distanceTo(b.x) > a.rad + b.rad) continue;
+        boxContacts(contacts, a, b);
+        boxContacts(contacts, b, a);
+      }
+  const imp = new THREE.Vector3(), slide = new THREE.Vector3();
   for (let it = 0; it < 10; it++)
     for (const c of contacts) {
-      vp.crossVectors(w, c.r).add(v);
       // normal: only pushes, aims for the bounce velocity
-      let dj = (c.target - vp.y) / kAlong(c.r, n);
+      let dj = (c.target - relVel(c, _vp).dot(c.n)) / c.k;
       const acc = Math.max(0, c.acc + dj);
       dj = acc - c.acc;
       c.acc = acc;
-      v.y += dj;
-      w.add(invInertia(b, rn.crossVectors(c.r, n).multiplyScalar(dj), _t));
+      push(c, imp.copy(c.n).multiplyScalar(dj));
       // friction: against the sliding velocity, at most FRICTION times the normal impulse
-      vp.crossVectors(w, c.r).add(v);
-      const slide = new THREE.Vector3(vp.x, 0, vp.z), sl = slide.length();
+      relVel(c, _vp);
+      slide.copy(_vp).addScaledVector(c.n, -_vp.dot(c.n));
+      const sl = slide.length();
       if (sl < 1e-6) continue;
       slide.divideScalar(sl);
-      const want = c.accT.clone().addScaledVector(slide, -sl / kAlong(c.r, slide));
+      const want = c.accT.clone().addScaledVector(slide, -sl / kAlong(c, slide));
       const max = FRICTION * c.acc;
       if (want.length() > max) want.setLength(max);
-      const jt = want.clone().sub(c.accT);
+      imp.copy(want).sub(c.accT);
       c.accT.copy(want);
-      v.add(jt);
-      w.add(invInertia(b, rn.crossVectors(c.r, jt), _t));
+      push(c, imp);
     }
-  x.y += pen * 0.8; // out of the floor
-  if (contacts.length) {
-    v.x *= CONTACT_DAMPING; v.z *= CONTACT_DAMPING; w.multiplyScalar(CONTACT_DAMPING);
+  for (const b of bodies) {
+    const {v, w} = b;
+    b.x.add(b.fix);
+    if (b.touch) {
+      v.x *= CONTACT_DAMPING; v.z *= CONTACT_DAMPING; w.multiplyScalar(CONTACT_DAMPING);
+    }
+    b.t += dt;
+    // a body resting on another one may lose touch for a step after being pushed out of it
+    b.rest = v.length() < 8 && w.length() < 0.08 ? b.rest + (b.touch ? dt : 0) : 0;
   }
-  b.t += dt;
-  b.rest = contacts.length && v.length() < 8 && w.length() < 0.08 ? b.rest + dt : 0;
-  return b.rest > 0.3 || b.t > 8; // at rest
+  return bodies.every((b) => b.rest > 0.3 || b.t > 8);
 }
+const stepBody = (b, dt) => stepBodies([b], FLOOR_ONLY, dt);
 
 // Fixed steps for the real time since the last call (at most 1/20 s of simulation after a stall); clock.t0 is the
-// real time simulated up to. True once the body is at rest.
-function runBody(b, clock, now) {
+// real time simulated up to. True once step() says all is at rest.
+function runSteps(step, clock, now) {
   let steps = Math.min(Math.round(((now - clock.t0) / 1000) * SLOW_MOTION / SIM_DT), 12);
   clock.t0 += (steps * SIM_DT * 1000) / SLOW_MOTION;
   if (steps === 12) clock.t0 = now;
-  while (steps-- > 0) if (stepBody(b, SIM_DT)) return true;
+  while (steps-- > 0) if (step(SIM_DT)) return true;
   return false;
 }
+const runBody = (b, clock, now) => runSteps((dt) => stepBody(b, dt), clock, now);
 
 function startIntro() {
   if (document.body.classList.contains('flat')) return finishIntro();
@@ -806,7 +905,7 @@ function finishIntro() {
   camera.position.copy(START_CAM);
   controls.target.copy(START_TARGET);
   controls.enabled = true;
-  floor.visible = glow.visible = false;
+  floor.visible = glow.visible = partsBox.visible = false;
   key.castShadow = false;
 }
 
@@ -823,7 +922,7 @@ function updateIntro(now) {
     camera.position.lerpVectors(f.cam, START_CAM, e);
     controls.target.lerpVectors(f.target, START_TARGET, e);
     shadowMat.opacity = 0.55 * (1 - e);
-    glowMat.opacity = 1 - e;
+    glowMat.opacity = boxMat.opacity = 1 - e;
     if (p === 1) finishIntro();
   }
   $('pickup').hidden = intro.phase !== 'floor';
@@ -925,6 +1024,8 @@ const battery = new THREE.Group();
   }
   const ir = 2 / BAT_R ** 2, il = 12 / (3 * BAT_R ** 2 + BAT_LEN ** 2);
   bat.body.invI.set(ir, il, il);
+  bat.body.half.set(h, BAT_R, BAT_R);
+  bat.body.rad = Math.hypot(h, BAT_R);
 }
 const isBattery = (o) => { for (; o; o = o.parent) if (o === battery) return true; return false; };
 
@@ -1033,61 +1134,188 @@ function updateBatHint() {
 }
 
 // ===================================================================================
-// Build game: on the first visit, and with "Rebuild it!", the bare board drops with its parts beside it. A click on
-// a part floats it into its place on the board, which then rises into the start view. "Assemble" does it quickly.
+// Build game: on the first visit, and with "Rebuild it!", the bare board drops behind a red parts box, its parts
+// drop into the box side by side. Each part has to be dragged onto its marker on the board, which then rises into the start
+// view. "Assemble" (or any key) puts the parts on by themselves.
 // ===================================================================================
 
 const BUILT_KEY = 'etboy-built'; // set once the board has been built: later visits start with the finished board
-// the bare board lands behind the parts and is held up there while it is built
-const BUILD_CAM = new THREE.Vector3(0, 120, 290), BUILD_TARGET = new THREE.Vector3(0, FLOOR_Y + 22, 0);
-const BOARD_SPOT = [0, -45], HOVER_POS = new THREE.Vector3(0, FLOOR_Y + 40, -45);
-// the side the latest part goes on faces the viewer
+// the bare board lands at the back and is held up there while it is built, the parts box in front of it
+const BUILD_CAM = new THREE.Vector3(0, 125, 235), BUILD_TARGET = new THREE.Vector3(0, FLOOR_Y + 22, -2);
+// portrait screens (phones) look down more steeply from further back: the box fits across, the board below the panel
+const BUILD_CAM_TALL = new THREE.Vector3(0, 280, 215), BUILD_TARGET_TALL = new THREE.Vector3(0, -8, -38);
+const buildCam = () => (host.clientWidth < host.clientHeight ? [BUILD_CAM_TALL, BUILD_TARGET_TALL] : [BUILD_CAM, BUILD_TARGET]);
+const BOARD_SPOT = [0, -42], HOVER_POS = new THREE.Vector3(0, FLOOR_Y + 40, -42);
+// the side the part in hand goes on faces the viewer
 const HOVER = {
   front: new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.3, 0, 0)),
   back: new THREE.Quaternion().setFromEuler(new THREE.Euler(-0.55, Math.PI, 0)),
 };
 const FLY_MS = 1100, POSE_MS = 900, CAM_MS = 900;       // a part to its place, the board turning, the camera
 const AUTO_FLY_MS = 420, AUTO_GAP_MS = 110;             // Assemble: shorter flights one after the other
-// in the order Assemble puts them on; pile: x, z on the floor in front of the bare board
+const SNAP_MS = 180, BOX_MS = 260;                      // let go: into its place, back over the box
+const SNAP_PX = 40, SNAP_PX_TOUCH = 56;                 // how near the pointer has to come to a marker
+const LIFT = 6;                                         // mm above its place while it hovers over it
+const DRAG_FRONT = 30;                                  // mm the part in hand floats in front of the board
+// The parts knocking into each other in the box costs a lot of CPU: off, they lie side by side in slots instead
+// and go back to their slot when let go. On, they tumble into the box in a pile and drop where they are let go.
+const PART_COLLISIONS = false;
+// the box: centre, inside half width (x) and depth (z, both from the slots unless PART_COLLISIONS), walls, floor
+const BOX_POS = new THREE.Vector3(0, FLOOR_Y, 30), BOX_HALF = new THREE.Vector2(60, 26);
+const BOX_WALL = 6, BOX_T = 2.5, BOX_BASE = 2, BOX_FLOOR = FLOOR_Y + BOX_BASE;
+const BOX_PLANES = [
+  {n: new THREE.Vector3(0, 1, 0), d: BOX_FLOOR},
+  {n: new THREE.Vector3(1, 0, 0)}, {n: new THREE.Vector3(-1, 0, 0)},
+  {n: new THREE.Vector3(0, 0, 1)}, {n: new THREE.Vector3(0, 0, -1)},
+];
+// the slots: two rows, the big parts at the back; gaps between them, margin to the walls
+// clang-format off
+const SLOT_ROWS = [['display', 'holder', 'battery'], ['btn_up', 'btn_down', 'btn_left', 'power', 'btn_right', 'btn_a', 'btn_b']];
+// clang-format on
+const SLOT_GAP = 7, BOX_MARGIN = 6, SLOT_DROP = 10; // mm, the drop height of the first part, more for each next one
+// in the order Assemble puts them on; the push buttons are all the same, any of them fits any button's place
 // clang-format off
 const PART_INFO = [
-  {id: 'display', name: 'Display module', side: 'front', pile: [0, 10]},
-  {id: 'btn_up', name: 'Button up', side: 'front'},
-  {id: 'btn_down', name: 'Button down', side: 'front'},
-  {id: 'btn_left', name: 'Button left', side: 'front'},
-  {id: 'btn_right', name: 'Button right', side: 'front'},
-  {id: 'btn_a', name: 'Button A', side: 'front'},
-  {id: 'btn_b', name: 'Button B', side: 'front'},
-  {id: 'power', name: 'Power switch', side: 'front'},
-  {id: 'holder', name: 'Battery holder', side: 'back', pile: [-58, 8]},
-  {id: 'battery', name: 'AAA battery', side: 'back', pile: [58, 8], needs: 'holder'},
+  {id: 'display', name: 'Display module'},
+  {id: 'btn_up', name: 'Push button'},
+  {id: 'btn_down', name: 'Push button'},
+  {id: 'btn_left', name: 'Push button'},
+  {id: 'btn_right', name: 'Push button'},
+  {id: 'btn_a', name: 'Push button'},
+  {id: 'btn_b', name: 'Push button'},
+  {id: 'power', name: 'Power switch'},
+  {id: 'holder', name: 'Battery holder'},
+  {id: 'battery', name: 'AAA battery', needs: 'holder'},
 ];
 // clang-format on
-const FRONT_ROW = [-72, -48, -24, 0, 24, 48, 72].map((x) => [x, 46]); // buttons and switch, shuffled each time
-const parts = []; // PART_INFO plus group, body, seat (position on the board), state: on, loose, fly
-const build = {active: false, auto: false, finishing: false, board: 'floor', side: 'front', t0: 0, camFrom: null};
+// PART_INFO plus kind, side, group, body, plunger (a button's), state (on, loose, drag, fly), dest (place it flies
+// to, null: back to the box), slotQ/slotX (its pose in the box: orientation, centre of mass)
+const parts = [];
+// the places on the board: id, kind, side, center (board frame), btn (a button's name), part (on it or on its way),
+// marker
+const seats = [];
+const build = {active: false, auto: false, finishing: false, board: 'floor', side: 'front', t0: 0, camFrom: null, drag: null, hover: null};
+
+// the box the parts lie in, red plastic
+const boxMat = new THREE.MeshStandardMaterial({color: 0xc8202a, roughness: 0.38, metalness: 0, transparent: true});
+const partsBox = new THREE.Group();
+partsBox.visible = false;
+scene.add(partsBox);
+function buildPartsBox() {
+  for (const pl of BOX_PLANES.slice(1)) // the walls
+    pl.d = pl.n.x ? pl.n.x * BOX_POS.x - BOX_HALF.x : pl.n.z * BOX_POS.z - BOX_HALF.y;
+  const slab = (w, h, d, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), boxMat);
+    m.position.set(x, y, z);
+    m.castShadow = m.receiveShadow = true;
+    partsBox.add(m);
+  };
+  const hx = BOX_HALF.x, hz = BOX_HALF.y;
+  slab(2 * (hx + BOX_T), BOX_BASE, 2 * (hz + BOX_T), 0, BOX_BASE / 2, 0);
+  for (const s of [-1, 1]) {
+    slab(2 * (hx + BOX_T), BOX_WALL, BOX_T, 0, BOX_WALL / 2, s * (hz + BOX_T / 2));
+    slab(BOX_T, BOX_WALL, 2 * hz, s * (hx + BOX_T / 2), BOX_WALL / 2, 0);
+    // a rim around the top
+    slab(2 * (hx + BOX_T) + 2, 1.2, BOX_T + 1, 0, BOX_WALL + 0.6, s * (hz + BOX_T / 2 + 0.5));
+    slab(BOX_T + 1, 1.2, 2 * hz, s * (hx + BOX_T / 2 + 0.5), BOX_WALL + 0.6, 0);
+  }
+  partsBox.position.copy(BOX_POS);
+}
+
+// Each part lies flat in its slot as it sits on the board, the side away from the PCB up; the box fits around them
+const _xAxis = new THREE.Vector3(1, 0, 0);
+function layoutParts() {
+  const rows = SLOT_ROWS.map((ids) => ids.map(partById));
+  for (const p of parts) {
+    p.slotQ = new THREE.Quaternion().setFromAxisAngle(_xAxis, p.side === 'front' ? -Math.PI / 2 : Math.PI / 2);
+    p.slotBox = new THREE.Box3();
+    for (const pt of p.body.pts) p.slotBox.expandByPoint(_v.copy(pt).applyQuaternion(p.slotQ));
+  }
+  const size = (p) => p.slotBox.getSize(_v);
+  const widths = rows.map((r) => r.reduce((w, p) => w + size(p).x, SLOT_GAP * (r.length - 1)));
+  const depths = rows.map((r) => Math.max(...r.map((p) => size(p).z)));
+  const depth = depths.reduce((a, b) => a + b, SLOT_GAP * (rows.length - 1));
+  if (!PART_COLLISIONS) BOX_HALF.set(Math.max(...widths) / 2 + BOX_MARGIN, depth / 2 + BOX_MARGIN);
+  let z = BOX_POS.z - depth / 2;
+  rows.forEach((r, i) => {
+    let x = BOX_POS.x - widths[i] / 2;
+    for (const p of r) {
+      const b = p.slotBox;
+      p.slotX = new THREE.Vector3(x - b.min.x, BOX_FLOOR - b.min.y, z + depths[i] / 2 - (b.min.z + b.max.z) / 2);
+      x += b.max.x - b.min.x + SLOT_GAP;
+    }
+    z += depths[i] + SLOT_GAP;
+  });
+  buildPartsBox();
+}
+
+// The target markers: corner brackets around each place, on the board's surface; they follow the board
+const markerRoot = new THREE.Group();
+markerRoot.matrixAutoUpdate = false;
+markerRoot.visible = false;
+scene.add(markerRoot);
+const MARK_COLOR = new THREE.Color(0x7fd4ff), SNAP_COLOR = new THREE.Color(0x8cff7a);
+
+function makeMarker(seat, w, h, z) {
+  const mat = (o) => new THREE.MeshBasicMaterial({color: MARK_COLOR, transparent: true, opacity: o, depthWrite: false, side: THREE.DoubleSide, toneMapped: false});
+  const m = new THREE.Group(), line = mat(0.4), fill = mat(0.06), pad = 1.2;
+  const fillMesh = new THREE.Mesh(new THREE.PlaneGeometry(w + 2 * pad, h + 2 * pad), fill);
+  m.add(fillMesh);
+  const W = w / 2 + pad, H = h / 2 + pad, arm = Math.min(6, Math.min(w, h) * 0.3 + 1), th = 0.6;
+  for (const sx of [-1, 1])
+    for (const sy of [-1, 1]) {
+      const a = new THREE.Mesh(new THREE.PlaneGeometry(arm, th), line), b = new THREE.Mesh(new THREE.PlaneGeometry(th, arm), line);
+      a.position.set(sx * (W - arm / 2), sy * (H - th / 2), 0.01);
+      b.position.set(sx * (W - th / 2), sy * (H - arm / 2), 0.01);
+      m.add(a, b);
+    }
+  m.position.set(seat.center.x, seat.center.y, z);
+  m.renderOrder = 2;
+  m.traverse((o) => { o.renderOrder = 2; });
+  m.userData = {line, fill};
+  markerRoot.add(m);
+  return m;
+}
 
 // Moves each part's nodes from the model into a group of its own (at the board's origin); false for an older model
 // without them
 function setupParts(board) {
   for (const info of PART_INFO) {
+    let group, b, center;
     if (info.id === 'battery') {
-      parts.push({...info, group: battery, body: bat.body, seat: BAT_SEAT, state: 'on'});
-      continue;
+      group = battery;
+      b = bat.body;
+      center = BAT_SEAT.clone();
+    } else {
+      const own = info.id === 'display' ? 'screen' : info.id; // the screen quad, a plunger, the slider
+      const nodes = board.children.filter((o) => o.name === own || o.name.startsWith(`part_${info.id}_`));
+      if (nodes.length < 2) return false;
+      group = new THREE.Group();
+      group.add(...nodes);
+      board.add(group);
+      b = newBody(0.15);
+      buildBody(b, group, 120);
+      center = b.com.clone();
     }
-    const own = info.id === 'display' ? 'screen' : info.id; // the screen quad, a plunger, the slider
-    const nodes = board.children.filter((o) => o.name === own || o.name.startsWith(`part_${info.id}_`));
-    if (nodes.length < 2) return false;
-    const group = new THREE.Group();
-    group.add(...nodes);
-    board.add(group);
-    const b = newBody(0.15);
-    buildBody(b, group);
-    parts.push({...info, group, body: b, seat: new THREE.Vector3(), state: 'on'});
+    const s = b.half;
+    setMass(b, Math.min(3, Math.max(0.3, (8 * s.x * s.y * s.z) / 2000))); // the display outweighs a button
+    const kind = info.id.startsWith('btn_') ? 'button' : info.id, side = center.z > 0 ? 'front' : 'back';
+    const plunger = Object.values(plungers).find((p) => p.node.parent === group);
+    const seat = {id: info.id, kind, side, center, btn: plunger && info.id.slice(4), part: null};
+    // on the PCB's surface; the battery's on top of the holder
+    const z = info.id === 'battery' ? BAT_SEAT.z - BAT_R : side === 'front' ? 1 : -1;
+    seat.marker = makeMarker(seat, 2 * s.x, 2 * s.y, z);
+    seats.push(seat);
+    parts.push({...info, kind, side, group, body: b, plunger, state: 'on', dest: seat});
   }
+  layoutParts();
   return true;
 }
 const partById = (id) => parts.find((p) => p.id === id);
+// free for a part: nothing on it or on its way, the battery's only once the holder is on
+const seatFree = (s) => !s.part && (s.kind !== 'battery' || partById('holder').state === 'on');
+// where Assemble puts a part: its own place, or another free one of the same kind
+const seatFor = (p) => [...seats].sort((a, b) => (b.id === p.id) - (a.id === p.id)).find((s) => s.kind === p.kind && seatFree(s));
 
 function partAt() {
   const loose = parts.filter((p) => p.state === 'loose').map((p) => p.group);
@@ -1110,12 +1338,25 @@ function updateBuildUI() {
   $('buildBtn').textContent = build.active ? 'Assemble' : 'Rebuild it!';
   $('buildBtn').title = build.active ? 'Put all parts on at once' : 'Take the board apart and put it together again';
   $('buildPanel').hidden = !build.active;
-  // the explanation until the first part is on its way, then only the progress
-  $('buildPanel').classList.toggle('compact', parts.some((p) => p.state !== 'loose'));
+  // the explanation until the first part is on, then only the progress
+  $('buildPanel').classList.toggle('compact', on > 0);
   $('buildCount').textContent = `${on} of ${parts.length} parts`;
   $('buildBar').style.width = (100 * on) / parts.length + '%';
 }
-for (const el of document.querySelectorAll('.clickWord')) el.textContent = matchMedia('(pointer: coarse)').matches ? 'Tap' : 'Click';
+
+// The parts in the box knock into each other and the walls until they all lie still; anything that moves them wakes
+// them up again
+const looseBodies = () => parts.filter((p) => p.state === 'loose').map((p) => p.body);
+function wakeParts() {
+  if (build.asleep) build.clock.t0 = performance.now();
+  build.asleep = false;
+  for (const b of looseBodies()) b.rest = b.t = 0;
+}
+function runParts(now) {
+  if (build.asleep) return;
+  const bodies = looseBodies();
+  if (!bodies.length || runSteps((dt) => stepBodies(bodies, BOX_PLANES, dt, PART_COLLISIONS), build.clock, now)) build.asleep = true;
+}
 
 // first: the page has just loaded, the camera starts in the build view
 function startBuild(first) {
@@ -1124,94 +1365,200 @@ function startBuild(first) {
   overlay.hidden = true;
   everOn = false; // the arrow at the switch shows again once it is built
   const now = performance.now();
-  // a battery lying on the floor joins the pile from there
-  if (bat.state === 'back' || bat.state === 'falling') bat.state = 'floor';
+  bat.state = 'parts';
   bat.shake = bat.kick = 0;
   floorShown = 0;
-  // the bare board drops in the middle, the parts around it, each from its own height
+  // the bare board drops on its spot, the parts into their slots one after the other (with PART_COLLISIONS into a
+  // pile, one above the other, the big ones first)
   rigBody = bareBody;
   startDrop(0, ...BOARD_SPOT);
-  const row = FRONT_ROW.slice().sort(() => Math.random() - 0.5);
-  parts.forEach((p, i) => {
+  for (const s of seats) s.part = null;
+  let y = BOX_FLOOR + 4;
+  const order = PART_COLLISIONS ? [...parts].sort((a, b) => b.body.rad - a.body.rad) : SLOT_ROWS.flat().map(partById);
+  order.forEach((p, i) => {
     scene.attach(p.group);
     const b = p.body;
-    b.q.random();
-    const [x, z] = p.pile ?? row.pop();
-    placeAbove(b, x + (Math.random() - 0.5) * 6, z + (Math.random() - 0.5) * 6, 35 + i * 6);
-    b.w.randomDirection().multiplyScalar(1.2);
-    if (reduceMotion) while (!stepBody(b, SIM_DT));
-    applyBody(b, p.group);
+    b.rest = b.t = 0;
     p.state = 'loose';
-    p.rest = reduceMotion;
-    p.clock = {t0: now};
+    p.dest = null;
+    if (!PART_COLLISIONS) {
+      b.q.copy(p.slotQ);
+      b.x.copy(p.slotX).y += SLOT_DROP + i * 6;
+      b.v.set(0, 0, 0);
+      b.w.set(0, 0, 0);
+      return;
+    }
+    const mx = Math.max(0, BOX_HALF.x - b.rad), mz = Math.max(0, BOX_HALF.y - b.rad);
+    b.q.random();
+    b.x.set(BOX_POS.x + (Math.random() * 2 - 1) * mx, y + b.rad, BOX_POS.z + (Math.random() * 2 - 1) * mz);
+    y += 2 * b.rad + 2;
+    b.v.set(0, -80, 0);
+    b.w.randomDirection().multiplyScalar(1.5);
   });
-  bat.state = 'parts';
+  build.clock = {t0: now};
+  build.asleep = false;
   if (reduceMotion) {
+    const bodies = looseBodies();
+    while (!stepBodies(bodies, BOX_PLANES, SIM_DT, PART_COLLISIONS));
+    build.asleep = true;
     while (!stepBody(rigBody, SIM_DT));
     applyBody(rigBody, rig);
   }
-  Object.assign(build, {active: true, auto: false, finishing: false, board: 'floor', side: 'front', t0: now, nextAt: 0, rest: reduceMotion});
-  build.clock = {t0: now};
+  for (const p of parts) applyBody(p.body, p.group);
+  Object.assign(build, {active: true, auto: false, finishing: false, board: 'floor', side: 'front', t0: now, nextAt: 0, rest: reduceMotion, drag: null, hover: null, last: now});
+  build.boardClock = {t0: now};
   build.camFrom = first || reduceMotion ? null : {cam: camera.position.clone(), target: controls.target.clone()};
   if (!build.camFrom) {
-    camera.position.copy(BUILD_CAM);
-    controls.target.copy(BUILD_TARGET);
+    const [cam, target] = buildCam();
+    camera.position.copy(cam);
+    controls.target.copy(target);
   }
   controls.enabled = !build.camFrom;
   intro.phase = 'build';
-  floor.visible = glow.visible = key.castShadow = true;
+  floor.visible = glow.visible = key.castShadow = partsBox.visible = true;
   shadowMat.opacity = 0.55;
-  glowMat.opacity = 1;
+  glowMat.opacity = boxMat.opacity = 1;
   $('buildMsg').textContent = '';
   $('status').textContent = 'in pieces';
   updateBuildUI();
 }
 
-// A part flies to its place; the board is picked up from the floor and turns the part's side to the viewer
-function flyPart(p, dur = FLY_MS) {
-  if (p.state !== 'loose') return;
-  const needs = p.needs && partById(p.needs);
-  if (needs && needs.state === 'loose') {
-    buildMessage(`The ${needs.name.toLowerCase()} has to go on first`);
-    p.body.v.y += 150; // a little hop: not yet
-    p.body.w.randomDirection().multiplyScalar(3);
-    p.rest = false;
-    return;
-  }
-  const now = performance.now();
+// The board, held up, turns the side to the viewer that the next part goes on
+function turnBoard(side) {
+  if (build.board === 'hover' && build.side === side) return;
+  build.poseFrom = {pos: rig.position.clone(), quat: rig.quaternion.clone()};
+  build.poseT0 = performance.now();
+  build.poseMs = reduceMotion ? 0 : build.auto ? AUTO_FLY_MS : POSE_MS;
+  build.board = 'hover';
+  build.side = side;
+}
+
+// A part flies into a place on the board (arc: mm it rises on the way)
+function flyPart(p, seat, dur, arc) {
+  if (p.state === 'loose') wakeParts(); // the others may lie on it
+  seat.part = p;
   p.state = 'fly';
-  updateBuildUI();
-  p.t0 = now;
+  p.dest = seat;
+  p.t0 = performance.now();
   p.dur = reduceMotion ? 0 : dur;
+  p.arc = arc;
   p.from = {pos: p.group.position.clone(), quat: p.group.quaternion.clone()};
-  if (build.board === 'floor' || build.side !== p.side) {
-    build.poseFrom = {pos: rig.position.clone(), quat: rig.quaternion.clone()};
-    build.poseT0 = now;
-    build.poseMs = reduceMotion ? 0 : build.auto ? AUTO_FLY_MS : POSE_MS;
-    build.board = 'hover';
-    build.side = p.side;
-  }
+  turnBoard(seat.side);
 }
 
 function flyNext() {
-  const p = parts.find((p) => p.state === 'loose' && (!p.needs || partById(p.needs).state !== 'loose'));
-  if (p) flyPart(p, build.auto ? AUTO_FLY_MS : FLY_MS);
+  for (const p of parts) {
+    const s = p.state === 'loose' && seatFor(p);
+    if (s) return void flyPart(p, s, build.auto ? AUTO_FLY_MS : FLY_MS, 30);
+  }
 }
 
 function placePart(p) {
+  const s = p.dest;
   if (p.group === battery) seatBattery(); // stays off: the switch is off
   else {
     boardNode.add(p.group);
-    p.group.position.copy(p.seat);
+    p.group.position.copy(s.center).sub(p.body.com);
     p.group.quaternion.identity();
+  }
+  if (p.plunger) { // a button on another button's place is that one now
+    p.plunger.node.userData.btn = s.btn;
+    plungers[s.btn] = p.plunger;
   }
   p.state = 'on';
   updateBuildUI();
 }
 
+// Picked up from the box: it follows the pointer, the board turning its side to the viewer
+function startDrag(p, e) {
+  build.drag = {part: p, id: e.pointerId, x: e.clientX, y: e.clientY, ndc: new THREE.Vector2(), moved: false, seat: null, touch: e.pointerType !== 'mouse'};
+  dragTo(e);
+  p.state = 'drag';
+  renderer.domElement.style.cursor = 'grabbing';
+  wakeParts();
+  turnBoard(p.side);
+  const needs = p.needs && partById(p.needs);
+  if (needs && needs.state !== 'on') buildMessage(`The ${needs.name.toLowerCase()} has to go on first`);
+}
+
+function dragTo(e) {
+  const d = build.drag, r = renderer.domElement.getBoundingClientRect();
+  d.ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 6) d.moved = true;
+}
+
+// Let go over its marker: into its place; anywhere else: back into its slot (with PART_COLLISIONS into the box where
+// it was let go, if that is over it)
+const _plane = new THREE.Plane(), _up = new THREE.Vector3(0, 1, 0);
+function endDrag(cancel) {
+  const d = build.drag, p = d.part;
+  build.drag = null;
+  renderer.domElement.style.cursor = '';
+  if (d.seat && !cancel) return void flyPart(p, d.seat, SNAP_MS, 0);
+  if (!d.moved && !cancel) buildMessage('Drag it onto its marker on the board');
+  const b = p.body, mx = Math.max(0, BOX_HALF.x - b.rad * 0.6), mz = Math.max(0, BOX_HALF.y - b.rad * 0.6);
+  let at;
+  if (PART_COLLISIONS) {
+    ray.setFromCamera(d.ndc, camera);
+    at = ray.ray.intersectPlane(_plane.set(_up, -(BOX_FLOOR + BOX_WALL)), new THREE.Vector3()) ?? BOX_POS.clone();
+    at.set(THREE.MathUtils.clamp(at.x, BOX_POS.x - mx, BOX_POS.x + mx), BOX_FLOOR + BOX_WALL + b.rad, THREE.MathUtils.clamp(at.z, BOX_POS.z - mz, BOX_POS.z + mz));
+    p.toQ = p.group.quaternion.clone();
+  } else {
+    at = p.slotX.clone();
+    at.y += SLOT_DROP;
+    p.toQ = p.slotQ;
+  }
+  p.state = 'fly';
+  p.dest = null;
+  p.t0 = performance.now();
+  p.dur = reduceMotion ? 0 : BOX_MS;
+  p.arc = 0;
+  p.from = {pos: p.group.position.clone(), quat: p.group.quaternion.clone()};
+  p.toBox = at.sub(b.com.clone().applyQuaternion(p.toQ));
+}
+
+function dropInBox(p) {
+  p.state = 'loose';
+  bodyFrom(p.body, p.group);
+  if (PART_COLLISIONS) p.body.w.randomDirection().multiplyScalar(0.8); // lands a little crooked
+  wakeParts();
+}
+
+// The part in hand: over the nearest free place of its kind near the pointer, or floating in front of the board
+const _v = new THREE.Vector3(), _n = new THREE.Vector3();
+function dragPart(p, dt) {
+  const d = build.drag, k = 1 - Math.exp(-dt * 22), w = host.clientWidth / 2, h = host.clientHeight / 2;
+  let best = (d.touch ? SNAP_PX_TOUCH : SNAP_PX) ** 2;
+  d.seat = null;
+  for (const s of seats) {
+    if (s.kind !== p.kind || s.side !== build.side || !seatFree(s)) continue;
+    _v.copy(s.center).applyMatrix4(boardNode.matrixWorld).project(camera);
+    const dd = ((_v.x - d.ndc.x) * w) ** 2 + ((_v.y - d.ndc.y) * h) ** 2;
+    if (dd < best) {
+      best = dd;
+      d.seat = s;
+    }
+  }
+  boardNode.getWorldQuaternion(_q);
+  if (d.seat) {
+    _v.copy(d.seat.center).sub(p.body.com);
+    _v.z += d.seat.side === 'front' ? LIFT : -LIFT;
+    _v.applyMatrix4(boardNode.matrixWorld);
+  } else {
+    _n.subVectors(camera.position, HOVER_POS).normalize();
+    _plane.setFromNormalAndCoplanarPoint(_n, _v.copy(HOVER_POS).addScaledVector(_n, DRAG_FRONT));
+    ray.setFromCamera(d.ndc, camera);
+    if (!ray.ray.intersectPlane(_plane, _v)) _v.copy(p.group.position);
+    else _v.sub(_s.copy(p.body.com).applyQuaternion(_q));
+  }
+  p.group.position.lerp(_v, k);
+  p.group.quaternion.slerp(_q, k);
+}
+
 // Assemble: the remaining parts fly on one after the other
 function assemble() {
   if (!build.active) return;
+  if (build.drag) endDrag(true);
   build.auto = true;
   build.nextAt = 0;
 }
@@ -1220,6 +1567,7 @@ $('buildBtn').onclick = () => (build.active ? assemble() : startBuild(false));
 // Done: the board rises into the start view
 function endBuild() {
   build.active = false;
+  markerRoot.visible = false;
   rigBody = body;
   try { localStorage.setItem(BUILT_KEY, '1'); } catch {}
   $('status').textContent = 'off';
@@ -1233,25 +1581,54 @@ function endBuild() {
 
 // Everything on at once (the flat view has no board to build on)
 function finishBuildNow() {
-  for (const p of parts) if (p.state !== 'on') placePart(p);
+  build.drag = null;
+  for (const p of parts) {
+    if (p.state === 'on') continue;
+    if (!p.dest) (p.dest = seatFor(p)).part = p;
+    placePart(p);
+  }
   endBuild();
   finishIntro();
 }
 
+// The markers of the free places on the side facing the viewer; those for the part in hand (or under the mouse)
+// pulse, the one it would go on now is green
+function updateMarkers(now) {
+  markerRoot.matrix.copy(boardNode.matrixWorld);
+  markerRoot.matrixWorldNeedsUpdate = true;
+  markerRoot.visible = true;
+  const d = build.drag, lit = d?.part.kind ?? build.hover?.kind, pulse = 0.5 + 0.5 * Math.sin(now / 160);
+  for (const s of seats) {
+    const m = s.marker, {line, fill} = m.userData;
+    m.visible = s.side === build.side && seatFree(s);
+    if (!m.visible) continue;
+    const snap = d?.seat === s, on = s.kind === lit;
+    line.color.copy(snap ? SNAP_COLOR : MARK_COLOR);
+    fill.color.copy(line.color);
+    line.opacity = snap ? 1 : on ? 0.6 + 0.4 * pulse : lit ? 0.15 : 0.45;
+    fill.opacity = snap ? 0.4 : on ? 0.1 + 0.12 * pulse : lit ? 0 : 0.06;
+    m.scale.setScalar(on && !snap ? 1 + 0.12 * pulse : 1);
+  }
+}
+
 const _m = new THREE.Matrix4(), _s = new THREE.Vector3();
 function updateBuild(now) {
+  const dt = Math.min(0.1, (now - build.last) / 1000);
+  build.last = now;
   if (build.camFrom) { // from wherever the camera was into the build view
     const p = Math.min(1, (now - build.t0) / CAM_MS), e = smooth(p);
-    camera.position.lerpVectors(build.camFrom.cam, BUILD_CAM, e);
-    controls.target.lerpVectors(build.camFrom.target, BUILD_TARGET, e);
+    const [cam, target] = buildCam();
+    camera.position.lerpVectors(build.camFrom.cam, cam, e);
+    controls.target.lerpVectors(build.camFrom.target, target, e);
     if (p === 1) {
       build.camFrom = null;
       controls.enabled = true;
     }
   }
   if (build.board === 'floor') {
-    if (!build.rest && runBody(rigBody, build.clock, now)) build.rest = true;
+    if (!build.rest && runBody(rigBody, build.boardClock, now)) build.rest = true;
     applyBody(rigBody, rig);
+    if (build.rest) turnBoard('front'); // landed: up to the viewer, ready for the parts
   } else {
     const p = build.poseMs ? Math.min(1, (now - build.poseT0) / build.poseMs) : 1, e = smooth(p);
     rig.position.lerpVectors(build.poseFrom.pos, HOVER_POS, e);
@@ -1262,19 +1639,25 @@ function updateBuild(now) {
     flyNext();
     build.nextAt = now + AUTO_GAP_MS;
   }
+  runParts(now);
   for (const p of parts) {
-    if (p.state === 'loose') {
-      if (!p.rest && runBody(p.body, p.clock, now)) p.rest = true;
-      applyBody(p.body, p.group);
-    } else if (p.state === 'fly') { // up in an arc and into the seat, wherever the board is by now
+    if (p.state === 'loose') applyBody(p.body, p.group);
+    else if (p.state === 'drag') dragPart(p, dt);
+    else if (p.state === 'fly') { // into its place, wherever the board is by now, or back over the box
       const t = p.dur ? Math.min(1, (now - p.t0) / p.dur) : 1, e = smooth(t);
-      _m.copy(boardNode.matrixWorld).multiply(new THREE.Matrix4().makeTranslation(p.seat));
-      _m.decompose(_p, _q, _s);
-      p.group.position.lerpVectors(p.from.pos, _p, e).y += Math.sin(Math.PI * t) * 30;
+      if (p.dest) {
+        _m.copy(boardNode.matrixWorld).multiply(new THREE.Matrix4().makeTranslation(_v.copy(p.dest.center).sub(p.body.com)));
+        _m.decompose(_p, _q, _s);
+      } else {
+        _p.copy(p.toBox);
+        _q.copy(p.toQ);
+      }
+      p.group.position.lerpVectors(p.from.pos, _p, e).y += Math.sin(Math.PI * t) * p.arc;
       p.group.quaternion.slerpQuaternions(p.from.quat, _q, e);
-      if (t === 1) placePart(p);
+      if (t === 1) p.dest ? placePart(p) : dropInBox(p);
     }
   }
+  updateMarkers(now);
   // all on: a moment to look at it, then up into the start view
   if (!build.finishing && parts.every((p) => p.state === 'on')) {
     build.finishing = true;
@@ -1337,12 +1720,12 @@ function aim(e) {
 renderer.domElement.addEventListener('pointerdown', (e) => {
   if (intro.phase === 'build') {
     aim(e);
-    const p = partAt();
+    const p = !build.drag && partAt();
     if (!p) return;
-    controls.enabled = false; // a click on a part, not a drag
+    controls.enabled = false; // dragging a part, not turning the view
     renderer.domElement.setPointerCapture(e.pointerId);
     $('partTag').hidden = true;
-    return void flyPart(p);
+    return void startDrag(p, e);
   }
   if (intro.phase !== 'done') return void raiseBoard();
   aim(e);
@@ -1365,24 +1748,33 @@ renderer.domElement.addEventListener('pointerdown', (e) => {
   updateButtons();
 });
 const release = (e) => {
+  if (build.drag?.id === e.pointerId) endDrag(e.type === 'pointercancel');
   for (const h of held) if (h.startsWith('ptr:' + e.pointerId + ':')) held.delete(h);
   controls.enabled = canOrbit();
   updateButtons();
 };
 const canOrbit = () => intro.phase === 'done' || (intro.phase === 'build' && !build.camFrom);
-// The name of the part under the mouse
+// The part in hand follows the pointer; the name of the part under the mouse, its markers light up
 renderer.domElement.addEventListener('pointermove', (e) => {
+  if (build.drag) {
+    if (build.drag.id === e.pointerId) dragTo(e);
+    return;
+  }
   const tag = $('partTag');
   const p = intro.phase === 'build' && e.pointerType === 'mouse' && !e.buttons ? (aim(e), partAt()) : null;
+  build.hover = p;
   tag.hidden = !p;
-  renderer.domElement.style.cursor = p ? 'pointer' : '';
+  renderer.domElement.style.cursor = p ? 'grab' : '';
   if (!p) return;
   const r = host.getBoundingClientRect();
   tag.textContent = p.name;
   tag.style.left = e.clientX - r.left + 'px';
   tag.style.top = e.clientY - r.top + 'px';
 });
-renderer.domElement.addEventListener('pointerleave', () => { $('partTag').hidden = true; });
+renderer.domElement.addEventListener('pointerleave', () => {
+  $('partTag').hidden = true;
+  build.hover = null;
+});
 renderer.domElement.addEventListener('pointerup', release);
 renderer.domElement.addEventListener('pointercancel', release);
 

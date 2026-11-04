@@ -597,8 +597,13 @@ controls.enableDamping = true;
 controls.minDistance = 60;
 controls.maxDistance = 500;
 const key = new THREE.DirectionalLight(0xffffff, 1.6);
-key.position.set(-60, 80, 120);
-scene.add(key, new THREE.AmbientLight(0xffffff, 0.25));
+key.position.set(-100, 120, 280); // behind the viewer and above: lights the board's face, not its top edge
+// two accents from below, grazing: a sheen along the bottom left and bottom right edges and the button rims
+const hiliteLeft = new THREE.DirectionalLight(0xffffff, 1.6);
+hiliteLeft.position.set(-240, -120, 60);
+const hiliteRight = new THREE.DirectionalLight(0xffeedd, 1.6); // a touch warmer
+hiliteRight.position.set(240, -120, 60);
+scene.add(key, hiliteLeft, hiliteRight, new THREE.AmbientLight(0xffffff, 0.25));
 
 // ===================================================================================
 // Intro: the board drops onto a floor; the first click, tap or key lifts it up to the viewer, then an arrow shows
@@ -712,7 +717,7 @@ function setMass(b, m) { // inertia scales along
 // Face up above the floor, a little turned and barely tilted, without spin
 function startDrop(yaw = 0.3, x = 0, z = 0) {
   const tilt = () => (Math.random() - 0.5) * 0.06, b = rigBody;
-  b.q.setFromEuler(new THREE.Euler(-Math.PI / 2 + BOARD_TILT + tilt(), yaw + (Math.random() - 0.5) * 0.3, tilt(), 'YXZ'));
+  b.q.setFromEuler(new THREE.Euler(-Math.PI / 2 - BOARD_TILT + tilt(), yaw + (Math.random() - 0.5) * 0.3, tilt(), 'YXZ'));
   placeAbove(b, x, z, DROP_HEIGHT);
   applyBody(b, rig);
 }
@@ -954,7 +959,7 @@ screenTex.colorSpace = THREE.SRGBColorSpace;
 const plungers = {};
 let ledMat = null, power = null, powerHit = null, boardNode = null;
 const POWER_TRAVEL = 1.5; // mm the slider moves from off (its position in the model) to on
-const BOARD_TILT = 0.12; // the board leans back a little in the start view
+const BOARD_TILT = 0.19; // start view: face on to the camera below, power switch on the top edge in sight
 
 // ===================================================================================
 // Battery: an AAA cell in the holder on the back. Clicking it fast enough rattles it loose until it pops out and
@@ -1681,7 +1686,7 @@ function updateBuild(now) {
 
 new GLTFLoader().load('etboy.glb', (gltf) => {
   const board = gltf.scene;
-  board.rotation.x = -BOARD_TILT;
+  board.rotation.x = BOARD_TILT;
   board.traverse((o) => {
     if (o.isMesh) o.castShadow = true;
     if (o.name === 'screen') o.material = new THREE.MeshBasicMaterial({map: screenTex, toneMapped: false});
